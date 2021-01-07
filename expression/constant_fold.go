@@ -15,6 +15,7 @@ package expression
 
 import (
 	"github.com/pingcap/parser/ast"
+	"github.com/pingcap/parser/mysql"
 	"github.com/pingcap/tidb/util/chunk"
 	"github.com/pingcap/tidb/util/logutil"
 	"go.uber.org/zap"
@@ -27,13 +28,40 @@ func init() {
 	specialFoldHandler = map[string]func(*ScalarFunction) (Expression, bool){
 		ast.If:     ifFoldHandler,
 		ast.Ifnull: ifNullFoldHandler,
+		ast.Case:   caseWhenHandler,
+		ast.IsNull: isNullHandler,
 	}
 }
 
 // FoldConstant does constant folding optimization on an expression excluding deferred ones.
 func FoldConstant(expr Expression) Expression {
 	e, _ := foldConstant(expr)
+	// keep the original coercibility values after folding
+	e.SetCoercibility(expr.Coercibility())
 	return e
+}
+
+func isNullHandler(expr *ScalarFunction) (Expression, bool) {
+	arg0 := expr.GetArgs()[0]
+	if constArg, isConst := arg0.(*Constant); isConst {
+		isDeferredConst := constArg.DeferredExpr != nil || constArg.ParamMarker != nil
+		value, err := expr.Eval(chunk.Row{})
+		if err != nil {
+			// Failed to fold this expr to a constant, print the DEBUG log and
+			// return the original expression to let the error to be evaluated
+			// again, in that time, the error is returned to the client.
+			logutil.BgLogger().Debug("fold expression to constant", zap.String("expression", expr.ExplainInfo()), zap.Error(err))
+			return expr, isDeferredConst
+		}
+		if isDeferredConst {
+			return &Constant{Value: value, RetType: expr.RetType, DeferredExpr: expr}, true
+		}
+		return &Constant{Value: value, RetType: expr.RetType}, false
+	}
+	if mysql.HasNotNullFlag(arg0.GetType().Flag) {
+		return NewZero(), false
+	}
+	return expr, false
 }
 
 func ifFoldHandler(expr *ScalarFunction) (Expression, bool) {
@@ -53,12 +81,8 @@ func ifFoldHandler(expr *ScalarFunction) (Expression, bool) {
 		}
 		return foldConstant(args[2])
 	}
-	var isDeferred, isDeferredConst bool
-	expr.GetArgs()[1], isDeferred = foldConstant(args[1])
-	isDeferredConst = isDeferredConst || isDeferred
-	expr.GetArgs()[2], isDeferred = foldConstant(args[2])
-	isDeferredConst = isDeferredConst || isDeferred
-	return expr, isDeferredConst
+	// if the condition is not const, which branch is unknown to run, so directly return.
+	return expr, false
 }
 
 func ifNullFoldHandler(expr *ScalarFunction) (Expression, bool) {
@@ -73,8 +97,50 @@ func ifNullFoldHandler(expr *ScalarFunction) (Expression, bool) {
 		}
 		return constArg, isDeferred
 	}
-	var isDeferredConst bool
-	expr.GetArgs()[1], isDeferredConst = foldConstant(args[1])
+	// if the condition is not const, which branch is unknown to run, so directly return.
+	return expr, false
+}
+
+func caseWhenHandler(expr *ScalarFunction) (Expression, bool) {
+	args, l := expr.GetArgs(), len(expr.GetArgs())
+	var isDeferred, isDeferredConst bool
+	for i := 0; i < l-1; i += 2 {
+		expr.GetArgs()[i], isDeferred = foldConstant(args[i])
+		isDeferredConst = isDeferredConst || isDeferred
+		if _, isConst := expr.GetArgs()[i].(*Constant); isConst {
+			// If the condition is const and true, and the previous conditions
+			// has no expr, then the folded execution body is returned, otherwise
+			// the arguments of the casewhen are folded and replaced.
+			val, isNull, err := args[i].EvalInt(expr.GetCtx(), chunk.Row{})
+			if err != nil {
+				return expr, false
+			}
+			if val != 0 && !isNull {
+				foldedExpr, isDeferred := foldConstant(args[i+1])
+				isDeferredConst = isDeferredConst || isDeferred
+				if _, isConst := foldedExpr.(*Constant); isConst {
+					foldedExpr.GetType().Decimal = expr.GetType().Decimal
+					return foldedExpr, isDeferredConst
+				}
+				return foldedExpr, isDeferredConst
+			}
+		} else {
+			// for no-const, here should return directly, because the following branches are unknown to be run or not
+			return expr, false
+		}
+	}
+	// If the number of arguments in casewhen is odd, and the previous conditions
+	// is false, then the folded else execution body is returned. otherwise
+	// the execution body of the else are folded and replaced.
+	if l%2 == 1 {
+		foldedExpr, isDeferred := foldConstant(args[l-1])
+		isDeferredConst = isDeferredConst || isDeferred
+		if _, isConst := foldedExpr.(*Constant); isConst {
+			foldedExpr.GetType().Decimal = expr.GetType().Decimal
+			return foldedExpr, isDeferredConst
+		}
+		return BuildCastFunction(expr.GetCtx(), foldedExpr, foldedExpr.GetType()), isDeferredConst
+	}
 	return expr, isDeferredConst
 }
 
@@ -95,13 +161,14 @@ func foldConstant(expr Expression) (Expression, bool) {
 		allConstArg := true
 		isDeferredConst := false
 		for i := 0; i < len(args); i++ {
-			foldedArg, isDeferred := foldConstant(args[i])
-			x.GetArgs()[i] = foldedArg
-			con, conOK := foldedArg.(*Constant)
-			argIsConst[i] = conOK
-			allConstArg = allConstArg && conOK
-			hasNullArg = hasNullArg || (conOK && con.Value.IsNull())
-			isDeferredConst = isDeferredConst || isDeferred
+			switch x := args[i].(type) {
+			case *Constant:
+				isDeferredConst = isDeferredConst || x.DeferredExpr != nil || x.ParamMarker != nil
+				argIsConst[i] = true
+				hasNullArg = hasNullArg || x.Value.IsNull()
+			default:
+				allConstArg = false
+			}
 		}
 		if !allConstArg {
 			if !hasNullArg || !sc.InNullRejectCheck || x.FuncName.L == ast.NullEQ {
@@ -112,7 +179,7 @@ func foldConstant(expr Expression) (Expression, bool) {
 				if argIsConst[i] {
 					constArgs[i] = arg
 				} else {
-					constArgs[i] = One
+					constArgs[i] = NewOne()
 				}
 			}
 			dummyScalarFunc, err := NewFunctionBase(x.GetCtx(), x.FuncName.L, x.GetType(), constArgs...)
@@ -147,7 +214,14 @@ func foldConstant(expr Expression) (Expression, bool) {
 		}
 		return &Constant{Value: value, RetType: x.RetType}, false
 	case *Constant:
-		if x.DeferredExpr != nil {
+		if x.ParamMarker != nil {
+			return &Constant{
+				Value:        x.ParamMarker.GetUserVar(),
+				RetType:      x.RetType,
+				DeferredExpr: x.DeferredExpr,
+				ParamMarker:  x.ParamMarker,
+			}, true
+		} else if x.DeferredExpr != nil {
 			value, err := x.DeferredExpr.Eval(chunk.Row{})
 			if err != nil {
 				logutil.BgLogger().Debug("fold expression to constant", zap.String("expression", x.ExplainInfo()), zap.Error(err))

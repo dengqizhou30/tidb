@@ -26,6 +26,7 @@ import (
 	. "github.com/pingcap/check"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/store/mockstore"
+	"github.com/pingcap/tidb/store/tikv/oracle"
 	"github.com/pingcap/tidb/util/logutil"
 	"github.com/pingcap/tidb/util/testleak"
 )
@@ -57,7 +58,7 @@ type testKVSuite struct {
 
 func (s *testKVSuite) SetUpSuite(c *C) {
 	testleak.BeforeTest()
-	store, err := mockstore.NewMockTikvStore()
+	store, err := mockstore.NewMockStore()
 	c.Assert(err, IsNil)
 	s.s = store
 }
@@ -147,7 +148,7 @@ func checkSeek(c *C, txn kv.Transaction) {
 func mustNotGet(c *C, txn kv.Transaction) {
 	for i := startIndex; i < testCount; i++ {
 		s := encodeInt(i * indexStep)
-		_, err := txn.Get(s)
+		_, err := txn.Get(context.TODO(), s)
 		c.Assert(err, NotNil)
 	}
 }
@@ -155,7 +156,7 @@ func mustNotGet(c *C, txn kv.Transaction) {
 func mustGet(c *C, txn kv.Transaction) {
 	for i := startIndex; i < testCount; i++ {
 		s := encodeInt(i * indexStep)
-		val, err := txn.Get(s)
+		val, err := txn.Get(context.TODO(), s)
 		c.Assert(err, IsNil)
 		c.Assert(string(val), Equals, string(s))
 	}
@@ -297,7 +298,7 @@ func (s *testKVSuite) TestDelete2(c *C) {
 	it, err := txn.Iter([]byte("DATA_test_tbl_department_record__0000000001_0003"), nil)
 	c.Assert(err, IsNil)
 	for it.Valid() {
-		err = txn.Delete([]byte(it.Key()))
+		err = txn.Delete(it.Key())
 		c.Assert(err, IsNil)
 		err = it.Next()
 		c.Assert(err, IsNil)
@@ -407,7 +408,7 @@ func (s *testKVSuite) TestRollback(c *C) {
 	defer txn.Commit(context.Background())
 
 	for i := startIndex; i < testCount; i++ {
-		_, err := txn.Get([]byte(strconv.Itoa(i)))
+		_, err := txn.Get(context.TODO(), []byte(strconv.Itoa(i)))
 		c.Assert(err, NotNil)
 	}
 }
@@ -434,7 +435,6 @@ func (s *testKVSuite) TestSeekMin(c *C) {
 	it, err := txn.Iter(nil, nil)
 	c.Assert(err, IsNil)
 	for it.Valid() {
-		fmt.Printf("%s, %s\n", it.Key(), it.Value())
 		it.Next()
 	}
 
@@ -531,7 +531,7 @@ func (s *testKVSuite) TestConditionUpdate(c *C) {
 
 func (s *testKVSuite) TestDBClose(c *C) {
 	c.Skip("don't know why it fails.")
-	store, err := mockstore.NewMockTikvStore()
+	store, err := mockstore.NewMockStore()
 	c.Assert(err, IsNil)
 
 	txn, err := store.Begin()
@@ -543,14 +543,13 @@ func (s *testKVSuite) TestDBClose(c *C) {
 	err = txn.Commit(context.Background())
 	c.Assert(err, IsNil)
 
-	ver, err := store.CurrentVersion()
+	ver, err := store.CurrentVersion(oracle.GlobalTxnScope)
 	c.Assert(err, IsNil)
 	c.Assert(kv.MaxVersion.Cmp(ver), Equals, 1)
 
-	snap, err := store.GetSnapshot(kv.MaxVersion)
-	c.Assert(err, IsNil)
+	snap := store.GetSnapshot(kv.MaxVersion)
 
-	_, err = snap.Get([]byte("a"))
+	_, err = snap.Get(context.TODO(), []byte("a"))
 	c.Assert(err, IsNil)
 
 	txn, err = store.Begin()
@@ -562,8 +561,7 @@ func (s *testKVSuite) TestDBClose(c *C) {
 	_, err = store.Begin()
 	c.Assert(err, NotNil)
 
-	_, err = store.GetSnapshot(kv.MaxVersion)
-	c.Assert(err, NotNil)
+	_ = store.GetSnapshot(kv.MaxVersion)
 
 	err = txn.Set([]byte("a"), []byte("b"))
 	c.Assert(err, IsNil)
@@ -646,7 +644,7 @@ func (s *testKVSuite) TestIsolationMultiInc(c *C) {
 
 	err := kv.RunInNewTxn(s.s, false, func(txn kv.Transaction) error {
 		for _, key := range keys {
-			id, err1 := kv.GetInt64(txn, key)
+			id, err1 := kv.GetInt64(context.TODO(), txn, key)
 			if err1 != nil {
 				return err1
 			}

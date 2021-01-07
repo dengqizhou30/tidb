@@ -14,13 +14,17 @@
 package executor_test
 
 import (
+	"fmt"
+	"time"
+
 	. "github.com/pingcap/check"
+	"github.com/pingcap/tidb/sessionctx/variable"
 	"github.com/pingcap/tidb/statistics"
 	"github.com/pingcap/tidb/util/testkit"
 )
 
 type testShowStatsSuite struct {
-	testSuite
+	*baseTestSuite
 }
 
 func (s *testShowStatsSuite) TestShowStatsMeta(c *C) {
@@ -79,11 +83,39 @@ func (s *testShowStatsSuite) TestShowStatsBuckets(c *C) {
 	result.Check(testkit.Rows("test t  a 0 0 1 1 1 1", "test t  b 0 0 1 1 1 1", "test t  idx 1 0 1 1 (1, 1) (1, 1)"))
 	result = tk.MustQuery("show stats_buckets where column_name = 'idx'")
 	result.Check(testkit.Rows("test t  idx 1 0 1 1 (1, 1) (1, 1)"))
+
+	tk.MustExec("drop table t")
+	tk.MustExec("create table t (`a` datetime, `b` int, key `idx`(`a`, `b`))")
+	tk.MustExec("insert into t values (\"2020-01-01\", 1)")
+	tk.MustExec("analyze table t")
+	result = tk.MustQuery("show stats_buckets").Sort()
+	result.Check(testkit.Rows("test t  a 0 0 1 1 2020-01-01 00:00:00 2020-01-01 00:00:00", "test t  b 0 0 1 1 1 1", "test t  idx 1 0 1 1 (2020-01-01 00:00:00, 1) (2020-01-01 00:00:00, 1)"))
+	result = tk.MustQuery("show stats_buckets where column_name = 'idx'")
+	result.Check(testkit.Rows("test t  idx 1 0 1 1 (2020-01-01 00:00:00, 1) (2020-01-01 00:00:00, 1)"))
+
+	tk.MustExec("drop table t")
+	tk.MustExec("create table t (`a` date, `b` int, key `idx`(`a`, `b`))")
+	tk.MustExec("insert into t values (\"2020-01-01\", 1)")
+	tk.MustExec("analyze table t")
+	result = tk.MustQuery("show stats_buckets").Sort()
+	result.Check(testkit.Rows("test t  a 0 0 1 1 2020-01-01 2020-01-01", "test t  b 0 0 1 1 1 1", "test t  idx 1 0 1 1 (2020-01-01, 1) (2020-01-01, 1)"))
+	result = tk.MustQuery("show stats_buckets where column_name = 'idx'")
+	result.Check(testkit.Rows("test t  idx 1 0 1 1 (2020-01-01, 1) (2020-01-01, 1)"))
+
+	tk.MustExec("drop table t")
+	tk.MustExec("create table t (`a` timestamp, `b` int, key `idx`(`a`, `b`))")
+	tk.MustExec("insert into t values (\"2020-01-01\", 1)")
+	tk.MustExec("analyze table t")
+	result = tk.MustQuery("show stats_buckets").Sort()
+	result.Check(testkit.Rows("test t  a 0 0 1 1 2020-01-01 00:00:00 2020-01-01 00:00:00", "test t  b 0 0 1 1 1 1", "test t  idx 1 0 1 1 (2020-01-01 00:00:00, 1) (2020-01-01 00:00:00, 1)"))
+	result = tk.MustQuery("show stats_buckets where column_name = 'idx'")
+	result.Check(testkit.Rows("test t  idx 1 0 1 1 (2020-01-01 00:00:00, 1) (2020-01-01 00:00:00, 1)"))
 }
 
 func (s *testShowStatsSuite) TestShowStatsHasNullValue(c *C) {
 	tk := testkit.NewTestKit(c, s.store)
 	tk.MustExec("use test")
+	tk.MustExec("drop table if exists t")
 	tk.MustExec("create table t (a int, index idx(a))")
 	tk.MustExec("insert into t values(NULL)")
 	tk.MustExec("analyze table t")
@@ -143,35 +175,37 @@ func (s *testShowStatsSuite) TestShowStatsHasNullValue(c *C) {
 
 func (s *testShowStatsSuite) TestShowPartitionStats(c *C) {
 	tk := testkit.NewTestKit(c, s.store)
-	tk.MustExec("set @@session.tidb_enable_table_partition=1")
-	tk.MustExec("use test")
-	tk.MustExec("drop table if exists t")
-	createTable := `CREATE TABLE t (a int, b int, primary key(a), index idx(b))
+	testkit.WithPruneMode(tk, variable.StaticOnly, func() {
+		tk.MustExec("set @@session.tidb_enable_table_partition=1")
+		tk.MustExec("use test")
+		tk.MustExec("drop table if exists t")
+		createTable := `CREATE TABLE t (a int, b int, primary key(a), index idx(b))
 						PARTITION BY RANGE ( a ) (PARTITION p0 VALUES LESS THAN (6))`
-	tk.MustExec(createTable)
-	tk.MustExec(`insert into t values (1, 1)`)
-	tk.MustExec("analyze table t")
+		tk.MustExec(createTable)
+		tk.MustExec(`insert into t values (1, 1)`)
+		tk.MustExec("analyze table t")
 
-	result := tk.MustQuery("show stats_meta")
-	c.Assert(len(result.Rows()), Equals, 1)
-	c.Assert(result.Rows()[0][0], Equals, "test")
-	c.Assert(result.Rows()[0][1], Equals, "t")
-	c.Assert(result.Rows()[0][2], Equals, "p0")
+		result := tk.MustQuery("show stats_meta")
+		c.Assert(len(result.Rows()), Equals, 1)
+		c.Assert(result.Rows()[0][0], Equals, "test")
+		c.Assert(result.Rows()[0][1], Equals, "t")
+		c.Assert(result.Rows()[0][2], Equals, "p0")
 
-	result = tk.MustQuery("show stats_histograms").Sort()
-	c.Assert(len(result.Rows()), Equals, 3)
-	c.Assert(result.Rows()[0][2], Equals, "p0")
-	c.Assert(result.Rows()[0][3], Equals, "a")
-	c.Assert(result.Rows()[1][2], Equals, "p0")
-	c.Assert(result.Rows()[1][3], Equals, "b")
-	c.Assert(result.Rows()[2][2], Equals, "p0")
-	c.Assert(result.Rows()[2][3], Equals, "idx")
+		result = tk.MustQuery("show stats_histograms").Sort()
+		c.Assert(len(result.Rows()), Equals, 3)
+		c.Assert(result.Rows()[0][2], Equals, "p0")
+		c.Assert(result.Rows()[0][3], Equals, "a")
+		c.Assert(result.Rows()[1][2], Equals, "p0")
+		c.Assert(result.Rows()[1][3], Equals, "b")
+		c.Assert(result.Rows()[2][2], Equals, "p0")
+		c.Assert(result.Rows()[2][3], Equals, "idx")
 
-	result = tk.MustQuery("show stats_buckets").Sort()
-	result.Check(testkit.Rows("test t p0 a 0 0 1 1 1 1", "test t p0 b 0 0 1 1 1 1", "test t p0 idx 1 0 1 1 1 1"))
+		result = tk.MustQuery("show stats_buckets").Sort()
+		result.Check(testkit.Rows("test t p0 a 0 0 1 1 1 1", "test t p0 b 0 0 1 1 1 1", "test t p0 idx 1 0 1 1 1 1"))
 
-	result = tk.MustQuery("show stats_healthy")
-	result.Check(testkit.Rows("test t p0 100"))
+		result = tk.MustQuery("show stats_healthy")
+		result.Check(testkit.Rows("test t p0 100"))
+	})
 }
 
 func (s *testShowStatsSuite) TestShowAnalyzeStatus(c *C) {
@@ -201,4 +235,29 @@ func (s *testShowStatsSuite) TestShowAnalyzeStatus(c *C) {
 	c.Assert(result.Rows()[1][4], Equals, "2")
 	c.Assert(result.Rows()[1][5], NotNil)
 	c.Assert(result.Rows()[1][6], Equals, "finished")
+}
+
+func (s *testShowStatsSuite) TestShowStatusSnapshot(c *C) {
+	tk := testkit.NewTestKit(c, s.store)
+	tk.MustExec("drop database if exists test;")
+	tk.MustExec("create database test;")
+	tk.MustExec("use test;")
+	tk.MustExec("create table t (a int);")
+
+	// For mocktikv, safe point is not initialized, we manually insert it for snapshot to use.
+	safePointName := "tikv_gc_safe_point"
+	safePointValue := "20060102-15:04:05 -0700"
+	safePointComment := "All versions after safe point can be accessed. (DO NOT EDIT)"
+	updateSafePoint := fmt.Sprintf(`INSERT INTO mysql.tidb VALUES ('%[1]s', '%[2]s', '%[3]s')
+	ON DUPLICATE KEY
+	UPDATE variable_value = '%[2]s', comment = '%[3]s'`, safePointName, safePointValue, safePointComment)
+	tk.MustExec(updateSafePoint)
+
+	snapshotTime := time.Now()
+
+	tk.MustExec("drop table t;")
+	tk.MustQuery("show table status;").Check(testkit.Rows())
+	tk.MustExec("set @@tidb_snapshot = '" + snapshotTime.Format("2006-01-02 15:04:05.999999") + "'")
+	result := tk.MustQuery("show table status;")
+	c.Check(result.Rows()[0][0], Matches, "t")
 }

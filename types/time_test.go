@@ -14,8 +14,11 @@
 package types_test
 
 import (
+	"fmt"
 	"math"
+	"testing"
 	"time"
+	"unsafe"
 
 	. "github.com/pingcap/check"
 	"github.com/pingcap/errors"
@@ -30,6 +33,35 @@ import (
 var _ = Suite(&testTimeSuite{})
 
 type testTimeSuite struct {
+}
+
+func (s *testTimeSuite) TestTimeEncoding(c *C) {
+	tests := []struct {
+		Year, Month, Day, Hour, Minute, Second, Microsecond int
+		Type                                                uint8
+		Fsp                                                 int8
+		Expect                                              uint64
+	}{
+		{2019, 9, 16, 0, 0, 0, 0, mysql.TypeDatetime, 0, 0b1111110001110011000000000000000000000000000000000000000000000},
+		{2019, 12, 31, 23, 59, 59, 999999, mysql.TypeTimestamp, 3, 0b1111110001111001111110111111011111011111101000010001111110111},
+		{2020, 1, 5, 0, 0, 0, 0, mysql.TypeDate, 0, 0b1111110010000010010100000000000000000000000000000000000001110},
+	}
+
+	for ith, tt := range tests {
+		ct := types.FromDate(tt.Year, tt.Month, tt.Day, tt.Hour, tt.Minute, tt.Second, tt.Microsecond)
+		t := types.NewTime(ct, tt.Type, tt.Fsp)
+		c.Check(*((*uint64)(unsafe.Pointer(&t))), Equals, tt.Expect, Commentf("%d failed.", ith))
+		c.Check(t.CoreTime(), Equals, ct, Commentf("%d core time failed.", ith))
+		c.Check(t.Type(), Equals, tt.Type, Commentf("%d type failed.", ith))
+		c.Check(t.Fsp(), Equals, tt.Fsp, Commentf("%d fsp failed.", ith))
+		c.Check(t.Year(), Equals, tt.Year, Commentf("%d year failed.", ith))
+		c.Check(t.Month(), Equals, tt.Month, Commentf("%d month failed.", ith))
+		c.Check(t.Day(), Equals, tt.Day, Commentf("%d day failed.", ith))
+		c.Check(t.Hour(), Equals, tt.Hour, Commentf("%d hour failed.", ith))
+		c.Check(t.Minute(), Equals, tt.Minute, Commentf("%d minute failed.", ith))
+		c.Check(t.Second(), Equals, tt.Second, Commentf("%d second failed.", ith))
+		c.Check(t.Microsecond(), Equals, tt.Microsecond, Commentf("%d microsecond failed.", ith))
+	}
 }
 
 func (s *testTimeSuite) TestDateTime(c *C) {
@@ -67,8 +99,22 @@ func (s *testTimeSuite) TestDateTime(c *C) {
 		{"2018-01-01 18", "2018-01-01 18:00:00"},
 		{"18-01-01 18", "2018-01-01 18:00:00"},
 		{"2018.01.01", "2018-01-01 00:00:00.00"},
+		{"2020.10.10 10.10.10", "2020-10-10 10:10:10.00"},
+		{"2020-10-10 10-10.10", "2020-10-10 10:10:10.00"},
+		{"2020-10-10 10.10", "2020-10-10 10:10:00.00"},
+		{"2018.01.01", "2018-01-01 00:00:00.00"},
 		{"2018.01.01 00:00:00", "2018-01-01 00:00:00"},
 		{"2018/01/01-00:00:00", "2018-01-01 00:00:00"},
+		{"4710072", "2047-10-07 02:00:00"},
+		{"2016-06-01 00:00:00 00:00:00", "2016-06-01 00:00:00"},
+		{"2020-06-01 00:00:00ads!,?*da;dsx", "2020-06-01 00:00:00"},
+
+		// For issue 22231
+		{"2020-05-28 23:59:59 00:00:00", "2020-05-28 23:59:59"},
+		{"2020-05-28 23:59:59-00:00:00", "2020-05-28 23:59:59"},
+		{"2020-05-28 23:59:59T T00:00:00", "2020-05-28 23:59:59"},
+		{"2020-10-22 10:31-10:12", "2020-10-22 10:31:10"},
+		{"2018.01.01 01:00:00", "2018-01-01 01:00:00"},
 	}
 
 	for _, test := range table {
@@ -79,7 +125,7 @@ func (s *testTimeSuite) TestDateTime(c *C) {
 
 	fspTbl := []struct {
 		Input  string
-		Fsp    int
+		Fsp    int8
 		Expect string
 	}{
 		{"20170118.123", 6, "2017-01-18 12:03:00.000000"},
@@ -93,6 +139,10 @@ func (s *testTimeSuite) TestDateTime(c *C) {
 		{"2017.00.05 23:59:58.575601", 3, "2017-00-05 23:59:58.576"},
 		{"2017/00/05 23:59:58.575601", 3, "2017-00-05 23:59:58.576"},
 		{"2017/00/05-23:59:58.575601", 3, "2017-00-05 23:59:58.576"},
+		{"1710-10:00", 0, "1710-10-00 00:00:00"},
+		{"1710.10+00", 0, "1710-10-00 00:00:00"},
+		{"2020-10:15", 0, "2020-10-15 00:00:00"},
+		{"2020.09-10:15", 0, "2020-09-10 15:00:00"},
 	}
 
 	for _, test := range fspTbl {
@@ -102,24 +152,33 @@ func (s *testTimeSuite) TestDateTime(c *C) {
 	}
 
 	t, _ := types.ParseTime(sc, "121231113045.9999999", mysql.TypeDatetime, 6)
-	c.Assert(t.Time.Second(), Equals, 46)
-	c.Assert(t.Time.Microsecond(), Equals, 0)
+	c.Assert(t.Second(), Equals, 46)
+	c.Assert(t.Microsecond(), Equals, 0)
 
 	// test error
 	errTable := []string{
 		"1000-01-01 00:00:70",
 		"1000-13-00 00:00:00",
+		"1201012736.0000",
+		"1201012736",
 		"10000-01-01 00:00:00",
 		"1000-09-31 00:00:00",
 		"1001-02-29 00:00:00",
 		"20170118.999",
 		"2018-01",
 		"2018.01",
+		"20170118-12:34",
+		"20170118-1234",
+		"170118-1234",
+		"170118-12",
+		"1710-10",
+		"1710-1000",
 	}
 
 	for _, test := range errTable {
 		_, err := types.ParseDatetime(sc, test)
-		c.Assert(err, NotNil)
+		c.Assert(err != nil || sc.WarningCount() > 0, Equals, true)
+		sc.SetWarnings(nil)
 	}
 }
 
@@ -157,15 +216,66 @@ func (s *testTimeSuite) TestDate(c *C) {
 		Input  string
 		Expect string
 	}{
-		{"2012-12-31", "2012-12-31"},
-		{"00-12-31", "2000-12-31"},
-		{"20121231", "2012-12-31"},
-		{"121231", "2012-12-31"},
+		// standard format
+		{"0001-12-13", "0001-12-13"},
+		{"2011-12-13", "2011-12-13"},
+		{"2011-12-13 10:10:10", "2011-12-13"},
 		{"2015-06-01 12:12:12", "2015-06-01"},
 		{"0001-01-01 00:00:00", "0001-01-01"},
-		{"0001-01-01", "0001-01-01"},
-		{"2019.01.01", "2019-01-01"},
-		{"2019/01/01", "2019-01-01"},
+		// 2-digit year
+		{"00-12-31", "2000-12-31"},
+		// alternative delimiters, any ASCII punctuation character is a valid delimiter,
+		// punctuation character is defined by C++ std::ispunct: any graphical character
+		// that is not alphanumeric.
+		{"2011\"12\"13", "2011-12-13"},
+		{"2011#12#13", "2011-12-13"},
+		{"2011$12$13", "2011-12-13"},
+		{"2011%12%13", "2011-12-13"},
+		{"2011&12&13", "2011-12-13"},
+		{"2011'12'13", "2011-12-13"},
+		{"2011(12(13", "2011-12-13"},
+		{"2011)12)13", "2011-12-13"},
+		{"2011*12*13", "2011-12-13"},
+		{"2011+12+13", "2011-12-13"},
+		{"2011,12,13", "2011-12-13"},
+		{"2011.12.13", "2011-12-13"},
+		{"2011/12/13", "2011-12-13"},
+		{"2011:12:13", "2011-12-13"},
+		{"2011;12;13", "2011-12-13"},
+		{"2011<12<13", "2011-12-13"},
+		{"2011=12=13", "2011-12-13"},
+		{"2011>12>13", "2011-12-13"},
+		{"2011?12?13", "2011-12-13"},
+		{"2011@12@13", "2011-12-13"},
+		{"2011[12[13", "2011-12-13"},
+		{"2011\\12\\13", "2011-12-13"},
+		{"2011]12]13", "2011-12-13"},
+		{"2011^12^13", "2011-12-13"},
+		{"2011_12_13", "2011-12-13"},
+		{"2011`12`13", "2011-12-13"},
+		{"2011{12{13", "2011-12-13"},
+		{"2011|12|13", "2011-12-13"},
+		{"2011}12}13", "2011-12-13"},
+		{"2011~12~13", "2011-12-13"},
+		// alternative separators with time
+		{"2011~12~13 12~12~12", "2011-12-13"},
+		{"2011~12~13T12~12~12", "2011-12-13"},
+		{"2011~12~13~12~12~12", "2011-12-13"},
+		// internal format (YYYYMMDD, YYYYYMMDDHHMMSS)
+		{"20111213", "2011-12-13"},
+		{"111213", "2011-12-13"},
+		// leading and trailing space
+		{" 2011-12-13", "2011-12-13"},
+		{"2011-12-13 ", "2011-12-13"},
+		{"   2011-12-13    ", "2011-12-13"},
+		// extra separators
+		{"2011-12--13", "2011-12-13"},
+		{"2011--12-13", "2011-12-13"},
+		{"2011-12..13", "2011-12-13"},
+		{"2011----12----13", "2011-12-13"},
+		{"2011~/.12)_#13T T.12~)12[~12", "2011-12-13"},
+		// combinations
+		{"   2011----12----13    ", "2011-12-13"},
 	}
 
 	for _, test := range table {
@@ -176,7 +286,16 @@ func (s *testTimeSuite) TestDate(c *C) {
 
 	errTable := []string{
 		"0121231",
+		"1201012736.0000",
+		"1201012736",
 		"2019.01",
+		// invalid separators
+		"2019 01 02",
+		"2019A01A02",
+		"2019-01T02",
+		"2011-12-13 10:10T10",
+		"2019–01–02", // en dash
+		"2019—01—02", // em dash
 	}
 
 	for _, test := range errTable {
@@ -215,7 +334,8 @@ func (s *testTimeSuite) TestTime(c *C) {
 		{"-838:59:59", "-838:59:59"},
 		{"838:59:59", "838:59:59"},
 		{"2011-11-11 00:00:01", "00:00:01"},
-		{"2011-11-11", "00:00:00"},
+		{"20111111121212.123", "12:12:12"},
+		{"2011-11-11T12:12:12", "12:12:12"},
 	}
 
 	for _, test := range table {
@@ -240,6 +360,7 @@ func (s *testTimeSuite) TestTime(c *C) {
 	}
 
 	errTable := []string{
+		"2011-11-11",
 		"232 10",
 		"-232 10",
 	}
@@ -248,6 +369,10 @@ func (s *testTimeSuite) TestTime(c *C) {
 		_, err := types.ParseDuration(sc, test, types.DefaultFsp)
 		c.Assert(err, NotNil)
 	}
+
+	t, err := types.ParseDuration(sc, "4294967295 0:59:59", types.DefaultFsp)
+	c.Assert(err, NotNil)
+	c.Assert(t.String(), Equals, "838:59:59")
 
 	// test time compare
 	cmpTable := []struct {
@@ -278,9 +403,9 @@ func (s *testTimeSuite) TestDurationAdd(c *C) {
 	defer testleak.AfterTest(c)()
 	table := []struct {
 		Input    string
-		Fsp      int
+		Fsp      int8
 		InputAdd string
-		FspAdd   int
+		FspAdd   int8
 		Expect   string
 	}{
 		{"00:00:00.1", 1, "00:00:00.1", 1, "00:00:00.2"},
@@ -317,9 +442,9 @@ func (s *testTimeSuite) TestDurationSub(c *C) {
 	defer testleak.AfterTest(c)()
 	table := []struct {
 		Input    string
-		Fsp      int
+		Fsp      int8
 		InputAdd string
-		FspAdd   int
+		FspAdd   int8
 		Expect   string
 	}{
 		{"00:00:00.1", 1, "00:00:00.1", 1, "00:00:00.0"},
@@ -342,7 +467,7 @@ func (s *testTimeSuite) TestTimeFsp(c *C) {
 	defer testleak.AfterTest(c)()
 	table := []struct {
 		Input  string
-		Fsp    int
+		Fsp    int8
 		Expect string
 	}{
 		{"00:00:00.1", 0, "00:00:00"},
@@ -365,10 +490,9 @@ func (s *testTimeSuite) TestTimeFsp(c *C) {
 
 	errTable := []struct {
 		Input string
-		Fsp   int
+		Fsp   int8
 	}{
 		{"00:00:00.1", -2},
-		{"00:00:00.1", 7},
 	}
 
 	for _, test := range errTable {
@@ -438,26 +562,6 @@ func (s *testTimeSuite) TestYear(c *C) {
 	}
 }
 
-func (s *testTimeSuite) getLocation(c *C) *time.Location {
-	locations := []string{"Asia/Shanghai", "Europe/Berlin"}
-	timeFormat := "Jan 2, 2006 at 3:04pm (MST)"
-
-	z, err := time.LoadLocation(locations[0])
-	c.Assert(err, IsNil)
-
-	t1, err := time.ParseInLocation(timeFormat, "Jul 9, 2012 at 5:02am (CEST)", z)
-	c.Assert(err, IsNil)
-	t2, err := time.Parse(timeFormat, "Jul 9, 2012 at 5:02am (CEST)")
-	c.Assert(err, IsNil)
-
-	if t1.Equal(t2) {
-		z, err = time.LoadLocation(locations[1])
-		c.Assert(err, IsNil)
-	}
-
-	return z
-}
-
 func (s *testTimeSuite) TestCodec(c *C) {
 	defer testleak.AfterTest(c)()
 
@@ -472,22 +576,18 @@ func (s *testTimeSuite) TestCodec(c *C) {
 	_, err = t.ToPackedUint()
 	c.Assert(err, IsNil)
 
-	var t1 types.Time
-	t1.Type = mysql.TypeTimestamp
-	t1.Time = types.FromGoTime(time.Now())
+	t1 := types.NewTime(types.FromGoTime(time.Now()), mysql.TypeTimestamp, 0)
 	packed, err := t1.ToPackedUint()
 	c.Assert(err, IsNil)
 
-	var t2 types.Time
-	t2.Type = mysql.TypeTimestamp
+	t2 := types.NewTime(types.ZeroCoreTime, mysql.TypeTimestamp, 0)
 	err = t2.FromPackedUint(packed)
 	c.Assert(err, IsNil)
 	c.Assert(t1.String(), Equals, t2.String())
 
 	packed, _ = types.ZeroDatetime.ToPackedUint()
 
-	var t3 types.Time
-	t3.Type = mysql.TypeDatetime
+	t3 := types.NewTime(types.ZeroCoreTime, mysql.TypeDatetime, 0)
 	err = t3.FromPackedUint(packed)
 	c.Assert(err, IsNil)
 	c.Assert(t3.String(), Equals, types.ZeroDatetime.String())
@@ -496,8 +596,7 @@ func (s *testTimeSuite) TestCodec(c *C) {
 	c.Assert(err, IsNil)
 	packed, _ = t.ToPackedUint()
 
-	var t4 types.Time
-	t4.Type = mysql.TypeDatetime
+	t4 := types.NewTime(types.ZeroCoreTime, mysql.TypeDatetime, 0)
 	err = t4.FromPackedUint(packed)
 	c.Assert(err, IsNil)
 	c.Assert(t.String(), Equals, t4.String())
@@ -510,14 +609,12 @@ func (s *testTimeSuite) TestCodec(c *C) {
 	}
 
 	for _, test := range tbl {
-		t, err := types.ParseTime(nil, test, mysql.TypeDatetime, types.MaxFsp)
+		t, err := types.ParseTime(sc, test, mysql.TypeDatetime, types.MaxFsp)
 		c.Assert(err, IsNil)
 
 		packed, _ = t.ToPackedUint()
 
-		var dest types.Time
-		dest.Type = mysql.TypeDatetime
-		dest.Fsp = types.MaxFsp
+		dest := types.NewTime(types.ZeroCoreTime, mysql.TypeDatetime, types.MaxFsp)
 		err = dest.FromPackedUint(packed)
 		c.Assert(err, IsNil)
 		c.Assert(dest.String(), Equals, test)
@@ -542,7 +639,7 @@ func (s *testTimeSuite) TestParseTimeFromNum(c *C) {
 		{2010101011, true, types.ZeroDatetimeStr, true, types.ZeroDatetimeStr, true, types.ZeroDateStr},
 		{201010101, false, "2000-02-01 01:01:01", false, "2000-02-01 01:01:01", false, "2000-02-01"},
 		{20101010, false, "2010-10-10 00:00:00", false, "2010-10-10 00:00:00", false, "2010-10-10"},
-		{2010101, true, types.ZeroDatetimeStr, true, types.ZeroDatetimeStr, true, types.ZeroDateStr},
+		{2010101, false, "0201-01-01 00:00:00", true, types.ZeroDatetimeStr, false, "0201-01-01"},
 		{201010, false, "2020-10-10 00:00:00", false, "2020-10-10 00:00:00", false, "2020-10-10"},
 		{20101, false, "2002-01-01 00:00:00", false, "2002-01-01 00:00:00", false, "2002-01-01"},
 		{2010, true, types.ZeroDatetimeStr, true, types.ZeroDatetimeStr, true, types.ZeroDateStr},
@@ -569,7 +666,7 @@ func (s *testTimeSuite) TestParseTimeFromNum(c *C) {
 			c.Assert(err, NotNil, Commentf("%d", ith))
 		} else {
 			c.Assert(err, IsNil)
-			c.Assert(t.Type, Equals, mysql.TypeDatetime)
+			c.Assert(t.Type(), Equals, mysql.TypeDatetime)
 		}
 		c.Assert(t.String(), Equals, test.ExpectDateTimeValue)
 
@@ -581,7 +678,7 @@ func (s *testTimeSuite) TestParseTimeFromNum(c *C) {
 			c.Assert(err, NotNil)
 		} else {
 			c.Assert(err, IsNil, Commentf("%d", ith))
-			c.Assert(t.Type, Equals, mysql.TypeTimestamp)
+			c.Assert(t.Type(), Equals, mysql.TypeTimestamp)
 		}
 		c.Assert(t.String(), Equals, test.ExpectTimeStampValue)
 
@@ -592,7 +689,7 @@ func (s *testTimeSuite) TestParseTimeFromNum(c *C) {
 			c.Assert(err, NotNil)
 		} else {
 			c.Assert(err, IsNil)
-			c.Assert(t.Type, Equals, mysql.TypeDate)
+			c.Assert(t.Type(), Equals, mysql.TypeDate)
 		}
 		c.Assert(t.String(), Equals, test.ExpectDateValue)
 	}
@@ -601,10 +698,13 @@ func (s *testTimeSuite) TestParseTimeFromNum(c *C) {
 func (s *testTimeSuite) TestToNumber(c *C) {
 	sc := mock.NewContext().GetSessionVars().StmtCtx
 	sc.IgnoreZeroInDate = true
+	losAngelesTz, err := time.LoadLocation("America/Los_Angeles")
+	c.Assert(err, IsNil)
+	sc.TimeZone = losAngelesTz
 	defer testleak.AfterTest(c)()
 	tblDateTime := []struct {
 		Input  string
-		Fsp    int
+		Fsp    int8
 		Expect string
 	}{
 		{"12-12-31 11:30:45", 0, "20121231113045"},
@@ -619,7 +719,7 @@ func (s *testTimeSuite) TestToNumber(c *C) {
 	}
 
 	for _, test := range tblDateTime {
-		t, err := types.ParseTime(nil, test.Input, mysql.TypeDatetime, test.Fsp)
+		t, err := types.ParseTime(sc, test.Input, mysql.TypeDatetime, test.Fsp)
 		c.Assert(err, IsNil)
 		c.Assert(t.ToNumber().String(), Equals, test.Expect)
 	}
@@ -627,7 +727,7 @@ func (s *testTimeSuite) TestToNumber(c *C) {
 	// Fix issue #1046
 	tblDate := []struct {
 		Input  string
-		Fsp    int
+		Fsp    int8
 		Expect string
 	}{
 		{"12-12-31 11:30:45", 0, "20121231"},
@@ -642,14 +742,14 @@ func (s *testTimeSuite) TestToNumber(c *C) {
 	}
 
 	for _, test := range tblDate {
-		t, err := types.ParseTime(nil, test.Input, mysql.TypeDate, 0)
+		t, err := types.ParseTime(sc, test.Input, mysql.TypeDate, 0)
 		c.Assert(err, IsNil)
 		c.Assert(t.ToNumber().String(), Equals, test.Expect)
 	}
 
 	tblDuration := []struct {
 		Input  string
-		Fsp    int
+		Fsp    int8
 		Expect string
 	}{
 		{"11:30:45", 0, "113045"},
@@ -672,11 +772,44 @@ func (s *testTimeSuite) TestToNumber(c *C) {
 	}
 }
 
+func (s *testTimeSuite) TestParseTimeFromFloatString(c *C) {
+	sc := mock.NewContext().GetSessionVars().StmtCtx
+	sc.IgnoreZeroInDate = true
+	defer testleak.AfterTest(c)()
+	table := []struct {
+		Input       string
+		Fsp         int8
+		ExpectError bool
+		Expect      string
+	}{
+		{"20170118.123", 3, false, "2017-01-18 00:00:00.000"},
+		{"121231113045.123345", 6, false, "2012-12-31 11:30:45.123345"},
+		{"20121231113045.123345", 6, false, "2012-12-31 11:30:45.123345"},
+		{"121231113045.9999999", 6, false, "2012-12-31 11:30:46.000000"},
+		{"170105084059.575601", 6, false, "2017-01-05 08:40:59.575601"},
+		{"201705051315111.22", 2, true, "0000-00-00 00:00:00.00"},
+		{"2011110859.1111", 4, true, "0000-00-00 00:00:00.0000"},
+		{"2011110859.1111", 4, true, "0000-00-00 00:00:00.0000"},
+		{"191203081.1111", 4, true, "0000-00-00 00:00:00.0000"},
+		{"43128.121105", 6, true, "0000-00-00 00:00:00.000000"},
+	}
+
+	for _, test := range table {
+		t, err := types.ParseTimeFromFloatString(sc, test.Input, mysql.TypeDatetime, test.Fsp)
+		if test.ExpectError {
+			c.Assert(err, NotNil)
+		} else {
+			c.Assert(err, IsNil)
+			c.Assert(t.String(), Equals, test.Expect)
+		}
+	}
+}
+
 func (s *testTimeSuite) TestParseFrac(c *C) {
 	defer testleak.AfterTest(c)()
 	tbl := []struct {
 		S        string
-		Fsp      int
+		Fsp      int8
 		Ret      int
 		Overflow bool
 	}{
@@ -716,7 +849,7 @@ func (s *testTimeSuite) TestRoundFrac(c *C) {
 	defer testleak.AfterTest(c)()
 	tbl := []struct {
 		Input  string
-		Fsp    int
+		Fsp    int8
 		Except string
 	}{
 		{"2012-12-31 11:30:45.123456", 4, "2012-12-31 11:30:45.1235"},
@@ -739,10 +872,35 @@ func (s *testTimeSuite) TestRoundFrac(c *C) {
 		c.Assert(err, IsNil)
 		c.Assert(nv.String(), Equals, t.Except)
 	}
+	// test different time zone
+	losAngelesTz, err := time.LoadLocation("America/Los_Angeles")
+	c.Assert(err, IsNil)
+	sc.TimeZone = losAngelesTz
+	tbl = []struct {
+		Input  string
+		Fsp    int8
+		Except string
+	}{
+		{"2019-11-25 07:25:45.123456", 4, "2019-11-25 07:25:45.1235"},
+		{"2019-11-25 07:25:45.123456", 5, "2019-11-25 07:25:45.12346"},
+		{"2019-11-25 07:25:45.123456", 0, "2019-11-25 07:25:45"},
+		{"2019-11-25 07:25:45.123456", 2, "2019-11-25 07:25:45.12"},
+		{"2019-11-26 11:30:45.999999", 4, "2019-11-26 11:30:46.0000"},
+		{"2019-11-26 11:30:45.999999", 0, "2019-11-26 11:30:46"},
+		{"2019-11-26 11:30:45.999999", 3, "2019-11-26 11:30:46.000"},
+	}
+
+	for _, t := range tbl {
+		v, err := types.ParseTime(sc, t.Input, mysql.TypeDatetime, types.MaxFsp)
+		c.Assert(err, IsNil)
+		nv, err := v.RoundFrac(sc, t.Fsp)
+		c.Assert(err, IsNil)
+		c.Assert(nv.String(), Equals, t.Except)
+	}
 
 	tbl = []struct {
 		Input  string
-		Fsp    int
+		Fsp    int8
 		Except string
 	}{
 		{"11:30:45.123456", 4, "11:30:45.1235"},
@@ -763,7 +921,7 @@ func (s *testTimeSuite) TestRoundFrac(c *C) {
 
 	cols := []struct {
 		input  time.Time
-		fsp    int
+		fsp    int8
 		output time.Time
 	}{
 		{time.Date(2011, 11, 11, 10, 10, 10, 888888, time.UTC), 0, time.Date(2011, 11, 11, 10, 10, 10, 11, time.UTC)},
@@ -778,10 +936,14 @@ func (s *testTimeSuite) TestRoundFrac(c *C) {
 }
 
 func (s *testTimeSuite) TestConvert(c *C) {
+	sc := mock.NewContext().GetSessionVars().StmtCtx
+	sc.IgnoreZeroInDate = true
+	losAngelesTz, _ := time.LoadLocation("America/Los_Angeles")
+	sc.TimeZone = losAngelesTz
 	defer testleak.AfterTest(c)()
 	tbl := []struct {
 		Input  string
-		Fsp    int
+		Fsp    int8
 		Except string
 	}{
 		{"2012-12-31 11:30:45.123456", 4, "11:30:45.1235"},
@@ -794,7 +956,7 @@ func (s *testTimeSuite) TestConvert(c *C) {
 	}
 
 	for _, t := range tbl {
-		v, err := types.ParseTime(nil, t.Input, mysql.TypeDatetime, t.Fsp)
+		v, err := types.ParseTime(sc, t.Input, mysql.TypeDatetime, t.Fsp)
 		c.Assert(err, IsNil)
 		nv, err := v.ConvertToDuration()
 		c.Assert(err, IsNil)
@@ -803,30 +965,29 @@ func (s *testTimeSuite) TestConvert(c *C) {
 
 	tblDuration := []struct {
 		Input string
-		Fsp   int
+		Fsp   int8
 	}{
 		{"11:30:45.123456", 4},
 		{"11:30:45.123456", 6},
 		{"11:30:45.123456", 0},
 		{"1 11:30:45.999999", 0},
 	}
-
-	sc := mock.NewContext().GetSessionVars().StmtCtx
+	// test different time zone.
 	sc.TimeZone = time.UTC
 	for _, t := range tblDuration {
 		v, err := types.ParseDuration(sc, t.Input, t.Fsp)
 		c.Assert(err, IsNil)
-		year, month, day := time.Now().In(time.UTC).Date()
-		n := time.Date(year, month, day, 0, 0, 0, 0, time.UTC)
+		year, month, day := time.Now().In(sc.TimeZone).Date()
+		n := time.Date(year, month, day, 0, 0, 0, 0, sc.TimeZone)
 		t, err := v.ConvertToTime(sc, mysql.TypeDatetime)
 		c.Assert(err, IsNil)
-		// TODO: Consider time_zone variable.
-		t1, _ := t.Time.GoTime(time.UTC)
+		t1, _ := t.GoTime(sc.TimeZone)
 		c.Assert(t1.Sub(n), Equals, v.Duration)
 	}
 }
 
 func (s *testTimeSuite) TestCompare(c *C) {
+	sc := &stmtctx.StatementContext{TimeZone: time.UTC}
 	defer testleak.AfterTest(c)()
 	tbl := []struct {
 		Arg1 string
@@ -841,7 +1002,7 @@ func (s *testTimeSuite) TestCompare(c *C) {
 	}
 
 	for _, t := range tbl {
-		v1, err := types.ParseTime(nil, t.Arg1, mysql.TypeDatetime, types.MaxFsp)
+		v1, err := types.ParseTime(sc, t.Arg1, mysql.TypeDatetime, types.MaxFsp)
 		c.Assert(err, IsNil)
 
 		ret, err := v1.CompareString(nil, t.Arg2)
@@ -849,7 +1010,7 @@ func (s *testTimeSuite) TestCompare(c *C) {
 		c.Assert(ret, Equals, t.Ret)
 	}
 
-	v1, err := types.ParseTime(nil, "2011-10-10 11:11:11", mysql.TypeDatetime, types.MaxFsp)
+	v1, err := types.ParseTime(sc, "2011-10-10 11:11:11", mysql.TypeDatetime, types.MaxFsp)
 	c.Assert(err, IsNil)
 	res, err := v1.CompareString(nil, "Test should error")
 	c.Assert(err, NotNil)
@@ -911,10 +1072,10 @@ func (s *testTimeSuite) TestParseDateFormat(c *C) {
 		{"2011-11-11 10", []string{"2011", "11", "11", "10"}},
 		{"2011-11-11T10:10:10.123456", []string{"2011", "11", "11", "10", "10", "10", "123456"}},
 		{"2011:11:11T10:10:10.123456", []string{"2011", "11", "11", "10", "10", "10", "123456"}},
+		{"2011-11-11  10:10:10", []string{"2011", "11", "11", "10", "10", "10"}},
 		{"xx2011-11-11 10:10:10", nil},
 		{"T10:10:10", nil},
-		{"2011-11-11x", nil},
-		{"2011-11-11  10:10:10", nil},
+		{"2011-11-11x", []string{"2011", "11", "11x"}},
 		{"xxx 10:10:10", nil},
 	}
 
@@ -924,11 +1085,11 @@ func (s *testTimeSuite) TestParseDateFormat(c *C) {
 	}
 }
 
-func (s *testTimeSuite) TestTamestampDiff(c *C) {
+func (s *testTimeSuite) TestTimestampDiff(c *C) {
 	tests := []struct {
 		unit   string
-		t1     types.MysqlTime
-		t2     types.MysqlTime
+		t1     types.CoreTime
+		t2     types.CoreTime
 		expect int64
 	}{
 		{"MONTH", types.FromDate(2002, 5, 30, 0, 0, 0, 0), types.FromDate(2001, 1, 1, 0, 0, 0, 0), -16},
@@ -941,16 +1102,8 @@ func (s *testTimeSuite) TestTamestampDiff(c *C) {
 	}
 
 	for _, test := range tests {
-		t1 := types.Time{
-			Time: test.t1,
-			Type: mysql.TypeDatetime,
-			Fsp:  6,
-		}
-		t2 := types.Time{
-			Time: test.t2,
-			Type: mysql.TypeDatetime,
-			Fsp:  6,
-		}
+		t1 := types.NewTime(test.t1, mysql.TypeDatetime, 6)
+		t2 := types.NewTime(test.t2, mysql.TypeDatetime, 6)
 		c.Assert(types.TimestampDiff(test.unit, t1, t2), Equals, test.expect)
 	}
 }
@@ -974,10 +1127,10 @@ func (s *testTimeSuite) TestDateFSP(c *C) {
 func (s *testTimeSuite) TestConvertTimeZone(c *C) {
 	loc, _ := time.LoadLocation("Asia/Shanghai")
 	tests := []struct {
-		input  types.MysqlTime
+		input  types.CoreTime
 		from   *time.Location
 		to     *time.Location
-		expect types.MysqlTime
+		expect types.CoreTime
 	}{
 		{types.FromDate(2017, 1, 1, 0, 0, 0, 0), time.UTC, loc, types.FromDate(2017, 1, 1, 8, 0, 0, 0)},
 		{types.FromDate(2017, 1, 1, 8, 0, 0, 0), loc, time.UTC, types.FromDate(2017, 1, 1, 0, 0, 0, 0)},
@@ -985,10 +1138,9 @@ func (s *testTimeSuite) TestConvertTimeZone(c *C) {
 	}
 
 	for _, test := range tests {
-		var t types.Time
-		t.Time = test.input
+		t := types.NewTime(test.input, 0, 0)
 		t.ConvertTimeZone(test.from, test.to)
-		c.Assert(t.Compare(types.Time{Time: test.expect}), Equals, 0)
+		c.Assert(t.Compare(types.NewTime(test.expect, 0, 0)), Equals, 0)
 	}
 }
 
@@ -1010,15 +1162,15 @@ func (s *testTimeSuite) TestTimeAdd(c *C) {
 		TimeZone: time.UTC,
 	}
 	for _, t := range tbl {
-		v1, err := types.ParseTime(nil, t.Arg1, mysql.TypeDatetime, types.MaxFsp)
+		v1, err := types.ParseTime(sc, t.Arg1, mysql.TypeDatetime, types.MaxFsp)
 		c.Assert(err, IsNil)
 		dur, err := types.ParseDuration(sc, t.Arg2, types.MaxFsp)
 		c.Assert(err, IsNil)
-		result, err := types.ParseTime(nil, t.Ret, mysql.TypeDatetime, types.MaxFsp)
+		result, err := types.ParseTime(sc, t.Ret, mysql.TypeDatetime, types.MaxFsp)
 		c.Assert(err, IsNil)
 		v2, err := v1.Add(sc, dur)
 		c.Assert(err, IsNil)
-		c.Assert(v2.Compare(result), Equals, 0, Commentf("%v %v", v2.Time, result.Time))
+		c.Assert(v2.Compare(result), Equals, 0, Commentf("%v %v", v2.CoreTime(), result.CoreTime()))
 	}
 }
 
@@ -1060,7 +1212,7 @@ func (s *testTimeSuite) TestCheckTimestamp(c *C) {
 
 	tests := []struct {
 		tz             *time.Location
-		input          types.MysqlTime
+		input          types.CoreTime
 		expectRetError bool
 	}{{
 		tz:             shanghaiTz,
@@ -1100,9 +1252,66 @@ func (s *testTimeSuite) TestCheckTimestamp(c *C) {
 	for _, t := range tests {
 		validTimestamp := types.CheckTimestampTypeForTest(&stmtctx.StatementContext{TimeZone: t.tz}, t.input)
 		if t.expectRetError {
-			c.Assert(validTimestamp, NotNil, Commentf("For %s", t.input))
+			c.Assert(validTimestamp, NotNil, Commentf("For %s %s", t.input, t.tz))
 		} else {
-			c.Assert(validTimestamp, IsNil, Commentf("For %s", t.input))
+			c.Assert(validTimestamp, IsNil, Commentf("For %s %s", t.input, t.tz))
+		}
+	}
+
+	// Issue #13605: "Invalid time format" caused by time zone issue
+	// Some regions like Los Angeles use daylight saving time, see https://en.wikipedia.org/wiki/Daylight_saving_time
+	losAngelesTz, _ := time.LoadLocation("America/Los_Angeles")
+	londonTz, _ := time.LoadLocation("Europe/London")
+
+	tests = []struct {
+		tz             *time.Location
+		input          types.CoreTime
+		expectRetError bool
+	}{{
+		tz:             losAngelesTz,
+		input:          types.FromDate(2018, 3, 11, 1, 0, 50, 0),
+		expectRetError: false,
+	}, {
+		tz:             losAngelesTz,
+		input:          types.FromDate(2018, 3, 11, 2, 0, 16, 0),
+		expectRetError: true,
+	}, {
+		tz:             losAngelesTz,
+		input:          types.FromDate(2018, 3, 11, 3, 0, 20, 0),
+		expectRetError: false,
+	}, {
+		tz:             shanghaiTz,
+		input:          types.FromDate(2018, 3, 11, 1, 0, 50, 0),
+		expectRetError: false,
+	}, {
+		tz:             shanghaiTz,
+		input:          types.FromDate(2018, 3, 11, 2, 0, 16, 0),
+		expectRetError: false,
+	}, {
+		tz:             shanghaiTz,
+		input:          types.FromDate(2018, 3, 11, 3, 0, 20, 0),
+		expectRetError: false,
+	}, {
+		tz:             londonTz,
+		input:          types.FromDate(2019, 3, 31, 0, 0, 20, 0),
+		expectRetError: false,
+	}, {
+		tz:             londonTz,
+		input:          types.FromDate(2019, 3, 31, 1, 0, 20, 0),
+		expectRetError: true,
+	}, {
+		tz:             londonTz,
+		input:          types.FromDate(2019, 3, 31, 2, 0, 20, 0),
+		expectRetError: false,
+	},
+	}
+
+	for _, t := range tests {
+		validTimestamp := types.CheckTimestampTypeForTest(&stmtctx.StatementContext{TimeZone: t.tz}, t.input)
+		if t.expectRetError {
+			c.Assert(validTimestamp, NotNil, Commentf("For %s %s", t.input, t.tz))
+		} else {
+			c.Assert(validTimestamp, IsNil, Commentf("For %s %s", t.input, t.tz))
 		}
 	}
 }
@@ -1210,6 +1419,11 @@ func (s *testTimeSuite) TestExtractDurationValue(c *C) {
 			failed: true,
 		},
 		{
+			unit:   "SECOND",
+			format: "50.-2",
+			ans:    "00:00:50",
+		},
+		{
 			unit:   "MONTH",
 			format: "1",
 			ans:    "720:00:00",
@@ -1244,44 +1458,35 @@ func (s *testTimeSuite) TestExtractDurationValue(c *C) {
 
 func (s *testTimeSuite) TestCurrentTime(c *C) {
 	res := types.CurrentTime(mysql.TypeTimestamp)
-	c.Assert(res.Time, NotNil)
-	c.Assert(res.Type, Equals, mysql.TypeTimestamp)
-	c.Assert(res.Fsp, Equals, 0)
+	c.Assert(res.Type(), Equals, mysql.TypeTimestamp)
+	c.Assert(res.Fsp(), Equals, int8(0))
 }
 
 func (s *testTimeSuite) TestInvalidZero(c *C) {
-	in := types.Time{
-		Time: types.ZeroTime,
-		Type: mysql.TypeTimestamp,
-		Fsp:  types.DefaultFsp,
-	}
+	in := types.NewTime(types.ZeroCoreTime, mysql.TypeTimestamp, types.DefaultFsp)
 	c.Assert(in.InvalidZero(), Equals, true)
-	in.Time = types.FromDate(2019, 00, 00, 00, 00, 00, 00)
+	in.SetCoreTime(types.FromDate(2019, 00, 00, 00, 00, 00, 00))
 	c.Assert(in.InvalidZero(), Equals, true)
-	in.Time = types.FromDate(2019, 04, 12, 12, 00, 00, 00)
+	in.SetCoreTime(types.FromDate(2019, 04, 12, 12, 00, 00, 00))
 	c.Assert(in.InvalidZero(), Equals, false)
 }
 
 func (s *testTimeSuite) TestGetFsp(c *C) {
 	res := types.GetFsp("2019:04:12 14:00:00.123456")
-	c.Assert(res, Equals, 6)
+	c.Assert(res, Equals, int8(6))
 
 	res = types.GetFsp("2019:04:12 14:00:00.1234567890")
-	c.Assert(res, Equals, 6)
+	c.Assert(res, Equals, int8(6))
 
 	res = types.GetFsp("2019:04:12 14:00:00.1")
-	c.Assert(res, Equals, 1)
+	c.Assert(res, Equals, int8(1))
 
 	res = types.GetFsp("2019:04:12 14:00:00")
-	c.Assert(res, Equals, 0)
+	c.Assert(res, Equals, int8(0))
 }
 
 func (s *testTimeSuite) TestExtractDatetimeNum(c *C) {
-	in := types.Time{
-		Time: types.FromDate(2019, 04, 12, 14, 00, 00, 0000),
-		Type: mysql.TypeTimestamp,
-		Fsp:  types.DefaultFsp,
-	}
+	in := types.NewTime(types.FromDate(2019, 04, 12, 14, 00, 00, 0000), mysql.TypeTimestamp, types.DefaultFsp)
 
 	res, err := types.ExtractDatetimeNum(&in, "day")
 	c.Assert(err, IsNil)
@@ -1327,11 +1532,7 @@ func (s *testTimeSuite) TestExtractDatetimeNum(c *C) {
 	c.Assert(res, Equals, int64(0))
 	c.Assert(err, ErrorMatches, "invalid unit.*")
 
-	in = types.Time{
-		Time: types.FromDate(0000, 00, 00, 00, 00, 00, 0000),
-		Type: mysql.TypeTimestamp,
-		Fsp:  types.DefaultFsp,
-	}
+	in = types.NewTime(types.FromDate(0000, 00, 00, 00, 00, 00, 0000), mysql.TypeTimestamp, types.DefaultFsp)
 
 	res, err = types.ExtractDatetimeNum(&in, "day")
 	c.Assert(err, IsNil)
@@ -1370,6 +1571,10 @@ func (s *testTimeSuite) TestExtractDurationNum(c *C) {
 		{"HOUR_MICROSECOND", 31536},
 		{"HOUR_SECOND", 0},
 		{"HOUR_MINUTE", 0},
+		{"DAY_MICROSECOND", 31536},
+		{"DAY_SECOND", 0},
+		{"DAY_MINUTE", 0},
+		{"DAY_HOUR", 0},
 	}
 
 	for _, col := range tbl {
@@ -1420,8 +1625,8 @@ func (s *testTimeSuite) TestParseDurationValue(c *C) {
 		{"-1 1", "YEAR_MONTH", -1, -1, 0, 0, nil},
 		{"-aa1bb1", "YEAR_MONTH", -1, -1, 0, 0, nil},
 		{" \t\n\r\n - aa1bb1 \t\n ", "YEAR_MONTH", -1, -1, 0, 0, nil},
-		{"1.111", "MICROSECOND", 0, 0, 0, 1000, types.ErrTruncatedWrongValue},
-		{"1.111", "DAY", 0, 0, 1, 0, types.ErrTruncatedWrongValue},
+		{"1.111", "MICROSECOND", 0, 0, 0, 1000, types.ErrTruncatedWrongVal},
+		{"1.111", "DAY", 0, 0, 1, 0, types.ErrTruncatedWrongVal},
 	}
 	for _, col := range tbl {
 		comment := Commentf("Extract %v Unit %v", col.format, col.unit)
@@ -1487,15 +1692,15 @@ func (s *testTimeSuite) TestParseTimeFromInt64(c *C) {
 	input := int64(20190412140000)
 	output, err := types.ParseTimeFromInt64(sc, input)
 	c.Assert(err, IsNil)
-	c.Assert(output.Fsp, Equals, types.DefaultFsp)
-	c.Assert(output.Type, Equals, mysql.TypeDatetime)
-	c.Assert(output.Time.Year(), Equals, 2019)
-	c.Assert(output.Time.Month(), Equals, 04)
-	c.Assert(output.Time.Day(), Equals, 12)
-	c.Assert(output.Time.Hour(), Equals, 14)
-	c.Assert(output.Time.Minute(), Equals, 00)
-	c.Assert(output.Time.Second(), Equals, 00)
-	c.Assert(output.Time.Microsecond(), Equals, 00)
+	c.Assert(output.Fsp(), Equals, types.DefaultFsp)
+	c.Assert(output.Type(), Equals, mysql.TypeDatetime)
+	c.Assert(output.Year(), Equals, 2019)
+	c.Assert(output.Month(), Equals, 04)
+	c.Assert(output.Day(), Equals, 12)
+	c.Assert(output.Hour(), Equals, 14)
+	c.Assert(output.Minute(), Equals, 00)
+	c.Assert(output.Second(), Equals, 00)
+	c.Assert(output.Microsecond(), Equals, 00)
 }
 
 func (s *testTimeSuite) TestGetFormatType(c *C) {
@@ -1548,6 +1753,11 @@ func (s *testTimeSuite) TestTimeOverflow(c *C) {
 		{"2018.01.01", false},
 		{"2018.01.01 00:00:00", false},
 		{"2018/01/01-00:00:00", false},
+		{"0999-12-31 22:00:00", false},
+		{"9999-12-31 23:59:59", false},
+		{"0001-01-01 00:00:00", false},
+		{"0001-01-01 23:59:59", false},
+		{"0000-01-01 00:00:00", true},
 	}
 
 	for _, test := range table {
@@ -1562,7 +1772,7 @@ func (s *testTimeSuite) TestTimeOverflow(c *C) {
 func (s *testTimeSuite) TestTruncateFrac(c *C) {
 	cols := []struct {
 		input  time.Time
-		fsp    int
+		fsp    int8
 		output time.Time
 	}{
 		{time.Date(2011, 11, 11, 10, 10, 10, 888888, time.UTC), 0, time.Date(2011, 11, 11, 10, 10, 10, 11, time.UTC)},
@@ -1590,9 +1800,9 @@ func (s *testTimeSuite) TestTimeSub(c *C) {
 		TimeZone: time.UTC,
 	}
 	for _, t := range tbl {
-		v1, err := types.ParseTime(nil, t.Arg1, mysql.TypeDatetime, types.MaxFsp)
+		v1, err := types.ParseTime(sc, t.Arg1, mysql.TypeDatetime, types.MaxFsp)
 		c.Assert(err, IsNil)
-		v2, err := types.ParseTime(nil, t.Arg2, mysql.TypeDatetime, types.MaxFsp)
+		v2, err := types.ParseTime(sc, t.Arg2, mysql.TypeDatetime, types.MaxFsp)
 		c.Assert(err, IsNil)
 		dur, err := types.ParseDuration(sc, t.Ret, types.MaxFsp)
 		c.Assert(err, IsNil)
@@ -1603,7 +1813,7 @@ func (s *testTimeSuite) TestTimeSub(c *C) {
 
 func (s *testTimeSuite) TestCheckMonthDay(c *C) {
 	dates := []struct {
-		date        types.MysqlTime
+		date        types.CoreTime
 		isValidDate bool
 	}{
 		{types.FromDate(1900, 2, 29, 0, 0, 0, 0), false},
@@ -1627,16 +1837,269 @@ func (s *testTimeSuite) TestCheckMonthDay(c *C) {
 	}
 
 	for _, t := range dates {
-		tt := types.Time{
-			Time: t.date,
-			Type: mysql.TypeDate,
-			Fsp:  types.DefaultFsp,
-		}
+		tt := types.NewTime(t.date, mysql.TypeDate, types.DefaultFsp)
 		err := tt.Check(sc)
 		if t.isValidDate {
 			c.Check(err, IsNil)
 		} else {
-			c.Check(types.ErrIncorrectDatetimeValue.Equal(err), IsTrue)
+			c.Check(types.ErrWrongValue.Equal(err), IsTrue)
 		}
 	}
+}
+func (s *testTimeSuite) TestFormatIntWidthN(c *C) {
+	cases := []struct {
+		num    int
+		width  int
+		result string
+	}{
+		{0, 0, "0"},
+		{1, 0, "1"},
+		{1, 1, "1"},
+		{1, 2, "01"},
+		{10, 2, "10"},
+		{99, 3, "099"},
+		{100, 3, "100"},
+		{999, 3, "999"},
+		{1000, 3, "1000"},
+	}
+	for _, ca := range cases {
+		re := types.FormatIntWidthN(ca.num, ca.width)
+		c.Assert(re, Equals, ca.result)
+	}
+}
+
+func (s *testTimeSuite) TestFromGoTime(c *C) {
+	// Test rounding of nanosecond to millisecond.
+	cases := []struct {
+		input string
+		yy    int
+		mm    int
+		dd    int
+		hh    int
+		min   int
+		sec   int
+		micro int
+	}{
+		{"2006-01-02T15:04:05.999999999Z", 2006, 1, 2, 15, 4, 6, 0},
+		{"2006-01-02T15:04:05.999999000Z", 2006, 1, 2, 15, 4, 5, 999999},
+		{"2006-01-02T15:04:05.999999499Z", 2006, 1, 2, 15, 4, 5, 999999},
+		{"2006-01-02T15:04:05.999999500Z", 2006, 1, 2, 15, 4, 6, 0},
+		{"2006-01-02T15:04:05.000000501Z", 2006, 1, 2, 15, 4, 5, 1},
+	}
+
+	for ith, ca := range cases {
+		t, err := time.Parse(time.RFC3339Nano, ca.input)
+		c.Assert(err, IsNil)
+
+		t1 := types.FromGoTime(t)
+		c.Assert(t1, Equals, types.FromDate(ca.yy, ca.mm, ca.dd, ca.hh, ca.min, ca.sec, ca.micro), Commentf("idx %d", ith))
+	}
+
+}
+
+func (s *testTimeSuite) TestGetTimezone(c *C) {
+	cases := []struct {
+		input    string
+		idx      int
+		tzSign   string
+		tzHour   string
+		tzSep    string
+		tzMinute string
+	}{
+		{"2020-10-10T10:10:10Z", 19, "", "", "", ""},
+		{"2020-10-10T10:10:10", -1, "", "", "", ""},
+		{"2020-10-10T10:10:10-08", 19, "-", "08", "", ""},
+		{"2020-10-10T10:10:10-0700", 19, "-", "07", "", "00"},
+		{"2020-10-10T10:10:10+08:20", 19, "+", "08", ":", "20"},
+		{"2020-10-10T10:10:10+08:10", 19, "+", "08", ":", "10"},
+		{"2020-10-10T10:10:10+8:00", -1, "", "", "", ""},
+		{"2020-10-10T10:10:10+082:10", -1, "", "", "", ""},
+		{"2020-10-10T10:10:10+08:101", -1, "", "", "", ""},
+		{"2020-10-10T10:10:10+T8:11", -1, "", "", "", ""},
+		{"2020-09-06T05:49:13.293Z", 23, "", "", "", ""},
+		{"2020-09-06T05:49:13.293", -1, "", "", "", ""},
+	}
+	for ith, ca := range cases {
+		idx, tzSign, tzHour, tzSep, tzMinute := types.GetTimezone(ca.input)
+		c.Assert([5]interface{}{idx, tzSign, tzHour, tzSep, tzMinute}, Equals, [5]interface{}{ca.idx, ca.tzSign, ca.tzHour, ca.tzSep, ca.tzMinute}, Commentf("idx %d", ith))
+	}
+}
+
+func (s *testTimeSuite) TestParseWithTimezone(c *C) {
+	getTZ := func(tzSign string, tzHour, tzMinue int) *time.Location {
+		offset := tzHour*60*60 + tzMinue*60
+		if tzSign == "-" {
+			offset = -offset
+		}
+		return time.FixedZone(fmt.Sprintf("UTC%s%02d:%02d", tzSign, tzHour, tzMinue), offset)
+	}
+	// lit is the string literal to be parsed, which contains timezone, and gt is the ground truth time
+	// in go's time.Time, while sysTZ is the system timezone where the string literal gets parsed.
+	// we first parse the string literal, and convert it into UTC and then compare it with the ground truth time in UTC.
+	// note that sysTZ won't affect the physical time the string literal represents.
+	cases := []struct {
+		lit          string
+		fsp          int8
+		parseChecker Checker
+		gt           time.Time
+		sysTZ        *time.Location
+	}{
+		{
+			"2006-01-02T15:04:05Z",
+			0,
+			IsNil,
+			time.Date(2006, 1, 2, 15, 4, 5, 0, getTZ("+", 0, 0)),
+			getTZ("+", 0, 0),
+		},
+		{
+			"2006-01-02T15:04:05Z",
+			0,
+			IsNil,
+			time.Date(2006, 1, 2, 15, 4, 5, 0, getTZ("+", 0, 0)),
+			getTZ("+", 10, 0),
+		},
+		{
+			"2020-10-21T16:05:10.50Z",
+			2,
+			IsNil,
+			time.Date(2020, 10, 21, 16, 5, 10, 500*1000*1000, getTZ("+", 0, 0)),
+			getTZ("-", 10, 0),
+		},
+		{
+			"2020-10-21T16:05:10.50+08",
+			2,
+			IsNil,
+			time.Date(2020, 10, 21, 16, 5, 10, 500*1000*1000, getTZ("+", 8, 0)),
+			getTZ("-", 10, 0),
+		},
+		{
+			"2020-10-21T16:05:10.50-0700",
+			2,
+			IsNil,
+			time.Date(2020, 10, 21, 16, 5, 10, 500*1000*1000, getTZ("-", 7, 0)),
+			getTZ("-", 10, 0),
+		},
+		{
+			"2020-10-21T16:05:10.50+09:00",
+			2,
+			IsNil,
+			time.Date(2020, 10, 21, 16, 5, 10, 500*1000*1000, getTZ("+", 9, 0)),
+			getTZ("-", 10, 0),
+		},
+		{
+			"2006-01-02T15:04:05+09:00",
+			0,
+			IsNil,
+			time.Date(2006, 1, 2, 15, 4, 5, 0, getTZ("+", 9, 0)),
+			getTZ("+", 8, 0),
+		},
+		{
+			"2006-01-02T15:04:05-02:00",
+			0,
+			IsNil,
+			time.Date(2006, 1, 2, 15, 4, 5, 0, getTZ("-", 2, 0)),
+			getTZ("+", 3, 0),
+		},
+		{
+			"2006-01-02T15:04:05-14:00",
+			0,
+			IsNil,
+			time.Date(2006, 1, 2, 15, 4, 5, 0, getTZ("-", 14, 0)),
+			getTZ("+", 14, 0),
+		},
+	}
+	for ith, ca := range cases {
+		t, err := types.ParseTime(&stmtctx.StatementContext{TimeZone: ca.sysTZ}, ca.lit, mysql.TypeTimestamp, ca.fsp)
+		c.Assert(err, ca.parseChecker, Commentf("tidb time parse misbehaved on %d", ith))
+		if err != nil {
+			continue
+		}
+		t1, err := t.GoTime(ca.sysTZ)
+		c.Assert(err, IsNil, Commentf("tidb time convert failed on %d", ith))
+		c.Assert(t1.In(time.UTC), Equals, ca.gt.In(time.UTC), Commentf("parsed time mismatch on %dth case", ith))
+	}
+}
+
+func BenchmarkFormat(b *testing.B) {
+	t1 := types.NewTime(types.FromGoTime(time.Now()), mysql.TypeTimestamp, 0)
+	for i := 0; i < b.N; i++ {
+		t1.DateFormat("%Y-%m-%d %H:%i:%s")
+	}
+}
+
+func BenchmarkTimeAdd(b *testing.B) {
+	sc := &stmtctx.StatementContext{
+		TimeZone: time.UTC,
+	}
+	arg1, _ := types.ParseTime(sc, "2017-01-18", mysql.TypeDatetime, types.MaxFsp)
+	arg2, _ := types.ParseDuration(sc, "12:30:59", types.MaxFsp)
+	for i := 0; i < b.N; i++ {
+		arg1.Add(sc, arg2)
+	}
+}
+
+func BenchmarkTimeCompare(b *testing.B) {
+	sc := &stmtctx.StatementContext{TimeZone: time.UTC}
+	mustParse := func(str string) types.Time {
+		t, err := types.ParseDatetime(sc, str)
+		if err != nil {
+			b.Fatal(err)
+		}
+		return t
+	}
+	tbl := []struct {
+		Arg1 types.Time
+		Arg2 types.Time
+	}{
+		{
+			mustParse("2011-10-10 11:11:11"),
+			mustParse("2011-10-10 11:11:11"),
+		},
+		{
+			mustParse("2011-10-10 11:11:11.123456"),
+			mustParse("2011-10-10 11:11:11.1"),
+		},
+		{
+			mustParse("2011-10-10 11:11:11"),
+			mustParse("2011-10-10 11:11:11.123"),
+		},
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		for _, c := range tbl {
+			c.Arg1.Compare(c.Arg2)
+		}
+	}
+}
+
+func benchmarkDateFormat(b *testing.B, name, str string) {
+	b.Run(name, func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			types.ParseDateFormat(str)
+		}
+	})
+}
+
+func BenchmarkParseDateFormat(b *testing.B) {
+	benchmarkDateFormat(b, "date basic", "2011-12-13")
+	benchmarkDateFormat(b, "date internal", "20111213")
+	benchmarkDateFormat(b, "datetime basic", "2011-12-13 14:15:16")
+	benchmarkDateFormat(b, "datetime internal", "20111213141516")
+	benchmarkDateFormat(b, "datetime basic frac", "2011-12-13 14:15:16.123456")
+	benchmarkDateFormat(b, "datetime repeated delimiters", "2011---12---13 14::15::16..123456")
+}
+
+func benchmarkDatetimeFormat(b *testing.B, name string, sc *stmtctx.StatementContext, str string) {
+	b.Run(name, func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			types.ParseDatetime(sc, str)
+		}
+	})
+}
+
+func BenchmarkParseDatetimeFormat(b *testing.B) {
+	sc := &stmtctx.StatementContext{TimeZone: time.UTC}
+	benchmarkDatetimeFormat(b, "datetime without timezone", sc, "2020-10-10T10:10:10")
+	benchmarkDatetimeFormat(b, "datetime with timezone", sc, "2020-10-10T10:10:10Z+08:00")
 }

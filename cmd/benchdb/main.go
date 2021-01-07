@@ -48,9 +48,6 @@ var (
 		"gc",
 		"select:0_10000:10",
 	}, "|"), "jobs to run")
-	sslCA   = flag.String("cacert", "", "path of file that contains list of trusted SSL CAs.")
-	sslCert = flag.String("cert", "", "path of file that contains X509 certificate in PEM format.")
-	sslKey  = flag.String("key", "", "path of file that contains X509 key in PEM format.")
 )
 
 func main() {
@@ -111,8 +108,17 @@ func newBenchDB() *benchDB {
 
 func (ut *benchDB) mustExec(sql string) {
 	rss, err := ut.session.Execute(context.Background(), sql)
+	defer func() {
+		for _, rs := range rss {
+			err = rs.Close()
+			if err != nil {
+				log.Fatal(err.Error())
+			}
+		}
+	}()
 	if err != nil {
 		log.Fatal(err.Error())
+		return
 	}
 	if len(rss) > 0 {
 		ctx := context.Background()

@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	. "github.com/pingcap/check"
 	"github.com/pingcap/errors"
@@ -28,13 +29,12 @@ import (
 	"github.com/pingcap/tidb/sessionctx/stmtctx"
 	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/util/chunk"
+	"github.com/pingcap/tidb/util/collate"
 	"github.com/pingcap/tidb/util/mock"
-	"github.com/pingcap/tidb/util/testleak"
 	"github.com/pingcap/tidb/util/testutil"
 )
 
-func (s *testEvaluatorSuite) TestLength(c *C) {
-	defer testleak.AfterTest(c)()
+func (s *testEvaluatorSuite) TestLengthAndOctetLength(c *C) {
 	cases := []struct {
 		args     interface{}
 		expected int64
@@ -46,37 +46,38 @@ func (s *testEvaluatorSuite) TestLength(c *C) {
 		{1, 1, false, false},
 		{3.14, 4, false, false},
 		{types.NewDecFromFloatForTest(123.123), 7, false, false},
-		{types.Time{Time: types.FromGoTime(time.Now()), Fsp: 6, Type: mysql.TypeDatetime}, 26, false, false},
+		{types.NewTime(types.FromGoTime(time.Now()), mysql.TypeDatetime, 6), 26, false, false},
 		{types.NewBinaryLiteralFromUint(0x01, -1), 1, false, false},
 		{types.Set{Value: 1, Name: "abc"}, 3, false, false},
-		{types.Duration{Duration: time.Duration(12*time.Hour + 1*time.Minute + 1*time.Second), Fsp: types.DefaultFsp}, 8, false, false},
+		{types.Duration{Duration: 12*time.Hour + 1*time.Minute + 1*time.Second, Fsp: types.DefaultFsp}, 8, false, false},
 		{nil, 0, true, false},
 		{errors.New("must error"), 0, false, true},
 	}
 
-	for _, t := range cases {
-		f, err := newFunctionForTest(s.ctx, ast.Length, s.primitiveValsToConstants([]interface{}{t.args})...)
-		c.Assert(err, IsNil)
-		d, err := f.Eval(chunk.Row{})
-		if t.getErr {
-			c.Assert(err, NotNil)
-		} else {
+	lengthMethods := []string{ast.Length, ast.OctetLength}
+	for _, lengthMethod := range lengthMethods {
+		for _, t := range cases {
+			f, err := newFunctionForTest(s.ctx, lengthMethod, s.primitiveValsToConstants([]interface{}{t.args})...)
 			c.Assert(err, IsNil)
-			if t.isNil {
-				c.Assert(d.Kind(), Equals, types.KindNull)
+			d, err := f.Eval(chunk.Row{})
+			if t.getErr {
+				c.Assert(err, NotNil)
 			} else {
-				c.Assert(d.GetInt64(), Equals, t.expected)
+				c.Assert(err, IsNil)
+				if t.isNil {
+					c.Assert(d.Kind(), Equals, types.KindNull)
+				} else {
+					c.Assert(d.GetInt64(), Equals, t.expected)
+				}
 			}
 		}
 	}
 
-	_, err := funcs[ast.Length].getFunction(s.ctx, []Expression{Zero})
+	_, err := funcs[ast.Length].getFunction(s.ctx, []Expression{NewZero()})
 	c.Assert(err, IsNil)
 }
 
 func (s *testEvaluatorSuite) TestASCII(c *C) {
-	defer testleak.AfterTest(c)()
-
 	cases := []struct {
 		args     interface{}
 		expected int64
@@ -108,12 +109,11 @@ func (s *testEvaluatorSuite) TestASCII(c *C) {
 			}
 		}
 	}
-	_, err := funcs[ast.Length].getFunction(s.ctx, []Expression{Zero})
+	_, err := funcs[ast.Length].getFunction(s.ctx, []Expression{NewZero()})
 	c.Assert(err, IsNil)
 }
 
 func (s *testEvaluatorSuite) TestConcat(c *C) {
-	defer testleak.AfterTest(c)()
 	cases := []struct {
 		args    []interface{}
 		isNil   bool
@@ -131,12 +131,9 @@ func (s *testEvaluatorSuite) TestConcat(c *C) {
 				1, 2,
 				1.1, 1.2,
 				types.NewDecFromFloatForTest(1.1),
-				types.Time{
-					Time: types.FromDate(2000, 1, 1, 12, 01, 01, 0),
-					Type: mysql.TypeDatetime,
-					Fsp:  types.DefaultFsp},
+				types.NewTime(types.FromDate(2000, 1, 1, 12, 01, 01, 0), mysql.TypeDatetime, types.DefaultFsp),
 				types.Duration{
-					Duration: time.Duration(12*time.Hour + 1*time.Minute + 1*time.Second),
+					Duration: 12*time.Hour + 1*time.Minute + 1*time.Second,
 					Fsp:      types.DefaultFsp},
 			},
 			false, false, "ab121.11.21.12000-01-01 12:01:0112:01:01",
@@ -171,8 +168,51 @@ func (s *testEvaluatorSuite) TestConcat(c *C) {
 	}
 }
 
+func (s *testEvaluatorSuite) TestConcatSig(c *C) {
+	colTypes := []*types.FieldType{
+		{Tp: mysql.TypeVarchar},
+		{Tp: mysql.TypeVarchar},
+	}
+	resultType := &types.FieldType{Tp: mysql.TypeVarchar, Flen: 1000}
+	args := []Expression{
+		&Column{Index: 0, RetType: colTypes[0]},
+		&Column{Index: 1, RetType: colTypes[1]},
+	}
+	base := baseBuiltinFunc{args: args, ctx: s.ctx, tp: resultType}
+	concat := &builtinConcatSig{base, 5}
+
+	cases := []struct {
+		args     []interface{}
+		warnings int
+		res      string
+	}{
+		{[]interface{}{"a", "b"}, 0, "ab"},
+		{[]interface{}{"aaa", "bbb"}, 1, ""},
+		{[]interface{}{"中", "a"}, 0, "中a"},
+		{[]interface{}{"中文", "a"}, 2, ""},
+	}
+
+	for _, t := range cases {
+		input := chunk.NewChunkWithCapacity(colTypes, 10)
+		input.AppendString(0, t.args[0].(string))
+		input.AppendString(1, t.args[1].(string))
+
+		res, isNull, err := concat.evalString(input.GetRow(0))
+		c.Assert(res, Equals, t.res)
+		c.Assert(err, IsNil)
+		if t.warnings == 0 {
+			c.Assert(isNull, IsFalse)
+		} else {
+			c.Assert(isNull, IsTrue)
+			warnings := s.ctx.GetSessionVars().StmtCtx.GetWarnings()
+			c.Assert(warnings, HasLen, t.warnings)
+			lastWarn := warnings[len(warnings)-1]
+			c.Assert(terror.ErrorEqual(errWarnAllowedPacketOverflowed, lastWarn.Err), IsTrue)
+		}
+	}
+}
+
 func (s *testEvaluatorSuite) TestConcatWS(c *C) {
-	defer testleak.AfterTest(c)()
 	cases := []struct {
 		args     []interface{}
 		isNil    bool
@@ -209,12 +249,9 @@ func (s *testEvaluatorSuite) TestConcatWS(c *C) {
 		{
 			[]interface{}{",", "a", "b", 1, 2, 1.1, 0.11,
 				types.NewDecFromFloatForTest(1.1),
-				types.Time{
-					Time: types.FromDate(2000, 1, 1, 12, 01, 01, 0),
-					Type: mysql.TypeDatetime,
-					Fsp:  types.DefaultFsp},
+				types.NewTime(types.FromDate(2000, 1, 1, 12, 01, 01, 0), mysql.TypeDatetime, types.DefaultFsp),
 				types.Duration{
-					Duration: time.Duration(12*time.Hour + 1*time.Minute + 1*time.Second),
+					Duration: 12*time.Hour + 1*time.Minute + 1*time.Second,
 					Fsp:      types.DefaultFsp},
 			},
 			false, false, "a,b,1,2,1.1,0.11,1.1,2000-01-01 12:01:01,12:01:01",
@@ -246,8 +283,54 @@ func (s *testEvaluatorSuite) TestConcatWS(c *C) {
 	c.Assert(err, IsNil)
 }
 
+func (s *testEvaluatorSuite) TestConcatWSSig(c *C) {
+	colTypes := []*types.FieldType{
+		{Tp: mysql.TypeVarchar},
+		{Tp: mysql.TypeVarchar},
+		{Tp: mysql.TypeVarchar},
+	}
+	resultType := &types.FieldType{Tp: mysql.TypeVarchar, Flen: 1000}
+	args := []Expression{
+		&Column{Index: 0, RetType: colTypes[0]},
+		&Column{Index: 1, RetType: colTypes[1]},
+		&Column{Index: 2, RetType: colTypes[2]},
+	}
+	base := baseBuiltinFunc{args: args, ctx: s.ctx, tp: resultType}
+	concat := &builtinConcatWSSig{base, 6}
+
+	cases := []struct {
+		args     []interface{}
+		warnings int
+		res      string
+	}{
+		{[]interface{}{",", "a", "b"}, 0, "a,b"},
+		{[]interface{}{",", "aaa", "bbb"}, 1, ""},
+		{[]interface{}{",", "中", "a"}, 0, "中,a"},
+		{[]interface{}{",", "中文", "a"}, 2, ""},
+	}
+
+	for _, t := range cases {
+		input := chunk.NewChunkWithCapacity(colTypes, 10)
+		input.AppendString(0, t.args[0].(string))
+		input.AppendString(1, t.args[1].(string))
+		input.AppendString(2, t.args[2].(string))
+
+		res, isNull, err := concat.evalString(input.GetRow(0))
+		c.Assert(res, Equals, t.res)
+		c.Assert(err, IsNil)
+		if t.warnings == 0 {
+			c.Assert(isNull, IsFalse)
+		} else {
+			c.Assert(isNull, IsTrue)
+			warnings := s.ctx.GetSessionVars().StmtCtx.GetWarnings()
+			c.Assert(warnings, HasLen, t.warnings)
+			lastWarn := warnings[len(warnings)-1]
+			c.Assert(terror.ErrorEqual(errWarnAllowedPacketOverflowed, lastWarn.Err), IsTrue)
+		}
+	}
+}
+
 func (s *testEvaluatorSuite) TestLeft(c *C) {
-	defer testleak.AfterTest(c)()
 	stmtCtx := s.ctx.GetSessionVars().StmtCtx
 	origin := stmtCtx.IgnoreTruncate
 	stmtCtx.IgnoreTruncate = true
@@ -297,7 +380,6 @@ func (s *testEvaluatorSuite) TestLeft(c *C) {
 }
 
 func (s *testEvaluatorSuite) TestRight(c *C) {
-	defer testleak.AfterTest(c)()
 	stmtCtx := s.ctx.GetSessionVars().StmtCtx
 	origin := stmtCtx.IgnoreTruncate
 	stmtCtx.IgnoreTruncate = true
@@ -347,7 +429,6 @@ func (s *testEvaluatorSuite) TestRight(c *C) {
 }
 
 func (s *testEvaluatorSuite) TestRepeat(c *C) {
-	defer testleak.AfterTest(c)()
 	args := []interface{}{"a", int64(2)}
 	fc := funcs[ast.Repeat]
 	f, err := fc.getFunction(s.ctx, s.datumsToConstants(types.MakeDatums(args...)))
@@ -445,7 +526,6 @@ func (s *testEvaluatorSuite) TestRepeatSig(c *C) {
 }
 
 func (s *testEvaluatorSuite) TestLower(c *C) {
-	defer testleak.AfterTest(c)()
 	cases := []struct {
 		args   []interface{}
 		isNil  bool
@@ -455,6 +535,10 @@ func (s *testEvaluatorSuite) TestLower(c *C) {
 		{[]interface{}{nil}, true, false, ""},
 		{[]interface{}{"ab"}, false, false, "ab"},
 		{[]interface{}{1}, false, false, "1"},
+		{[]interface{}{"one week’s time TEST"}, false, false, "one week’s time test"},
+		{[]interface{}{"one week's time TEST"}, false, false, "one week's time test"},
+		{[]interface{}{"ABC测试DEF"}, false, false, "abc测试def"},
+		{[]interface{}{"ABCテストDEF"}, false, false, "abcテストdef"},
 	}
 
 	for _, t := range cases {
@@ -478,7 +562,6 @@ func (s *testEvaluatorSuite) TestLower(c *C) {
 }
 
 func (s *testEvaluatorSuite) TestUpper(c *C) {
-	defer testleak.AfterTest(c)()
 	cases := []struct {
 		args   []interface{}
 		isNil  bool
@@ -488,6 +571,10 @@ func (s *testEvaluatorSuite) TestUpper(c *C) {
 		{[]interface{}{nil}, true, false, ""},
 		{[]interface{}{"ab"}, false, false, "ab"},
 		{[]interface{}{1}, false, false, "1"},
+		{[]interface{}{"one week’s time TEST"}, false, false, "ONE WEEK’S TIME TEST"},
+		{[]interface{}{"one week's time TEST"}, false, false, "ONE WEEK'S TIME TEST"},
+		{[]interface{}{"abc测试def"}, false, false, "ABC测试DEF"},
+		{[]interface{}{"abcテストdef"}, false, false, "ABCテストDEF"},
 	}
 
 	for _, t := range cases {
@@ -511,7 +598,6 @@ func (s *testEvaluatorSuite) TestUpper(c *C) {
 }
 
 func (s *testEvaluatorSuite) TestReverse(c *C) {
-	defer testleak.AfterTest(c)()
 	fc := funcs[ast.Reverse]
 	f, err := fc.getFunction(s.ctx, s.datumsToConstants(types.MakeDatums(nil)))
 	c.Assert(err, IsNil)
@@ -542,7 +628,6 @@ func (s *testEvaluatorSuite) TestReverse(c *C) {
 }
 
 func (s *testEvaluatorSuite) TestStrcmp(c *C) {
-	defer testleak.AfterTest(c)()
 	cases := []struct {
 		args   []interface{}
 		isNil  bool
@@ -583,8 +668,6 @@ func (s *testEvaluatorSuite) TestStrcmp(c *C) {
 }
 
 func (s *testEvaluatorSuite) TestReplace(c *C) {
-	defer testleak.AfterTest(c)()
-
 	cases := []struct {
 		args   []interface{}
 		isNil  bool
@@ -620,13 +703,11 @@ func (s *testEvaluatorSuite) TestReplace(c *C) {
 		}
 	}
 
-	_, err := funcs[ast.Replace].getFunction(s.ctx, []Expression{Zero, Zero, Zero})
+	_, err := funcs[ast.Replace].getFunction(s.ctx, []Expression{NewZero(), NewZero(), NewZero()})
 	c.Assert(err, IsNil)
 }
 
 func (s *testEvaluatorSuite) TestSubstring(c *C) {
-	defer testleak.AfterTest(c)()
-
 	cases := []struct {
 		args   []interface{}
 		isNil  bool
@@ -666,15 +747,14 @@ func (s *testEvaluatorSuite) TestSubstring(c *C) {
 		}
 	}
 
-	_, err := funcs[ast.Substring].getFunction(s.ctx, []Expression{Zero, Zero, Zero})
+	_, err := funcs[ast.Substring].getFunction(s.ctx, []Expression{NewZero(), NewZero(), NewZero()})
 	c.Assert(err, IsNil)
 
-	_, err = funcs[ast.Substring].getFunction(s.ctx, []Expression{Zero, Zero})
+	_, err = funcs[ast.Substring].getFunction(s.ctx, []Expression{NewZero(), NewZero()})
 	c.Assert(err, IsNil)
 }
 
 func (s *testEvaluatorSuite) TestConvert(c *C) {
-	defer testleak.AfterTest(c)()
 	tbl := []struct {
 		str           interface{}
 		cs            string
@@ -734,8 +814,6 @@ func (s *testEvaluatorSuite) TestConvert(c *C) {
 }
 
 func (s *testEvaluatorSuite) TestSubstringIndex(c *C) {
-	defer testleak.AfterTest(c)()
-
 	cases := []struct {
 		args   []interface{}
 		isNil  bool
@@ -777,12 +855,11 @@ func (s *testEvaluatorSuite) TestSubstringIndex(c *C) {
 		}
 	}
 
-	_, err := funcs[ast.SubstringIndex].getFunction(s.ctx, []Expression{Zero, Zero, Zero})
+	_, err := funcs[ast.SubstringIndex].getFunction(s.ctx, []Expression{NewZero(), NewZero(), NewZero()})
 	c.Assert(err, IsNil)
 }
 
 func (s *testEvaluatorSuite) TestSpace(c *C) {
-	defer testleak.AfterTest(c)()
 	stmtCtx := s.ctx.GetSessionVars().StmtCtx
 	origin := stmtCtx.IgnoreTruncate
 	stmtCtx.IgnoreTruncate = true
@@ -823,7 +900,7 @@ func (s *testEvaluatorSuite) TestSpace(c *C) {
 		}
 	}
 
-	_, err := funcs[ast.Space].getFunction(s.ctx, []Expression{Zero})
+	_, err := funcs[ast.Space].getFunction(s.ctx, []Expression{NewZero()})
 	c.Assert(err, IsNil)
 }
 
@@ -856,7 +933,6 @@ func (s *testEvaluatorSuite) TestSpaceSig(c *C) {
 
 func (s *testEvaluatorSuite) TestLocate(c *C) {
 	// 1. Test LOCATE without binary input.
-	defer testleak.AfterTest(c)()
 	tbl := []struct {
 		Args []interface{}
 		Want interface{}
@@ -869,7 +945,7 @@ func (s *testEvaluatorSuite) TestLocate(c *C) {
 		{[]interface{}{"好世", "你好世界"}, 2},
 		{[]interface{}{"界面", "你好世界"}, 0},
 		{[]interface{}{"b", "中a英b文"}, 4},
-		{[]interface{}{"BaR", "foobArbar"}, 4},
+		{[]interface{}{"bAr", "foobArbar"}, 4},
 		{[]interface{}{nil, "foobar"}, nil},
 		{[]interface{}{"bar", nil}, nil},
 		{[]interface{}{"bar", "foobarbar", 5}, 7},
@@ -881,7 +957,7 @@ func (s *testEvaluatorSuite) TestLocate(c *C) {
 		{[]interface{}{"A", "大A写的A", 1}, 2},
 		{[]interface{}{"A", "大A写的A", 2}, 2},
 		{[]interface{}{"A", "大A写的A", 3}, 5},
-		{[]interface{}{"bAr", "foobarBaR", 5}, 7},
+		{[]interface{}{"BaR", "foobarBaR", 5}, 7},
 		{[]interface{}{nil, nil}, nil},
 		{[]interface{}{"", nil}, nil},
 		{[]interface{}{nil, ""}, nil},
@@ -927,7 +1003,6 @@ func (s *testEvaluatorSuite) TestLocate(c *C) {
 }
 
 func (s *testEvaluatorSuite) TestTrim(c *C) {
-	defer testleak.AfterTest(c)()
 	cases := []struct {
 		args   []interface{}
 		isNil  bool
@@ -969,18 +1044,17 @@ func (s *testEvaluatorSuite) TestTrim(c *C) {
 		}
 	}
 
-	_, err := funcs[ast.Trim].getFunction(s.ctx, []Expression{Zero})
+	_, err := funcs[ast.Trim].getFunction(s.ctx, []Expression{NewZero()})
 	c.Assert(err, IsNil)
 
-	_, err = funcs[ast.Trim].getFunction(s.ctx, []Expression{Zero, Zero})
+	_, err = funcs[ast.Trim].getFunction(s.ctx, []Expression{NewZero(), NewZero()})
 	c.Assert(err, IsNil)
 
-	_, err = funcs[ast.Trim].getFunction(s.ctx, []Expression{Zero, Zero, Zero})
+	_, err = funcs[ast.Trim].getFunction(s.ctx, []Expression{NewZero(), NewZero(), NewZero()})
 	c.Assert(err, IsNil)
 }
 
 func (s *testEvaluatorSuite) TestLTrim(c *C) {
-	defer testleak.AfterTest(c)()
 	cases := []struct {
 		arg    interface{}
 		isNil  bool
@@ -1017,12 +1091,11 @@ func (s *testEvaluatorSuite) TestLTrim(c *C) {
 		}
 	}
 
-	_, err := funcs[ast.LTrim].getFunction(s.ctx, []Expression{Zero})
+	_, err := funcs[ast.LTrim].getFunction(s.ctx, []Expression{NewZero()})
 	c.Assert(err, IsNil)
 }
 
 func (s *testEvaluatorSuite) TestRTrim(c *C) {
-	defer testleak.AfterTest(c)()
 	cases := []struct {
 		arg    interface{}
 		isNil  bool
@@ -1057,12 +1130,11 @@ func (s *testEvaluatorSuite) TestRTrim(c *C) {
 		}
 	}
 
-	_, err := funcs[ast.RTrim].getFunction(s.ctx, []Expression{Zero})
+	_, err := funcs[ast.RTrim].getFunction(s.ctx, []Expression{NewZero()})
 	c.Assert(err, IsNil)
 }
 
 func (s *testEvaluatorSuite) TestHexFunc(c *C) {
-	defer testleak.AfterTest(c)()
 	cases := []struct {
 		arg    interface{}
 		isNil  bool
@@ -1106,7 +1178,6 @@ func (s *testEvaluatorSuite) TestHexFunc(c *C) {
 }
 
 func (s *testEvaluatorSuite) TestUnhexFunc(c *C) {
-	defer testleak.AfterTest(c)()
 	cases := []struct {
 		arg    interface{}
 		isNil  bool
@@ -1141,12 +1212,11 @@ func (s *testEvaluatorSuite) TestUnhexFunc(c *C) {
 		}
 	}
 
-	_, err := funcs[ast.Unhex].getFunction(s.ctx, []Expression{Zero})
+	_, err := funcs[ast.Unhex].getFunction(s.ctx, []Expression{NewZero()})
 	c.Assert(err, IsNil)
 }
 
 func (s *testEvaluatorSuite) TestBitLength(c *C) {
-	defer testleak.AfterTest(c)()
 	cases := []struct {
 		args     interface{}
 		expected int64
@@ -1174,12 +1244,11 @@ func (s *testEvaluatorSuite) TestBitLength(c *C) {
 		}
 	}
 
-	_, err := funcs[ast.BitLength].getFunction(s.ctx, []Expression{Zero})
+	_, err := funcs[ast.BitLength].getFunction(s.ctx, []Expression{NewZero()})
 	c.Assert(err, IsNil)
 }
 
 func (s *testEvaluatorSuite) TestChar(c *C) {
-	defer testleak.AfterTest(c)()
 	stmtCtx := s.ctx.GetSessionVars().StmtCtx
 	origin := stmtCtx.IgnoreTruncate
 	stmtCtx.IgnoreTruncate = true
@@ -1205,10 +1274,7 @@ func (s *testEvaluatorSuite) TestChar(c *C) {
 			c.Assert(err, IsNil)
 			c.Assert(f, NotNil)
 			r, err := evalBuiltinFunc(f, chunk.Row{})
-			if err != nil {
-				fmt.Printf("%s\n", err.Error())
-			}
-			c.Assert(err, IsNil)
+			c.Assert(err, IsNil, Commentf("err: %v", err))
 			c.Assert(r, testutil.DatumEquals, types.NewDatum(v.result))
 		}
 	}
@@ -1219,17 +1285,9 @@ func (s *testEvaluatorSuite) TestChar(c *C) {
 	r, err := evalBuiltinFunc(f, chunk.Row{})
 	c.Assert(err, IsNil)
 	c.Assert(r, testutil.DatumEquals, types.NewDatum("AB"))
-
-	// Test unsupported charset.
-	fc = funcs[ast.CharFunc]
-	f, err = fc.getFunction(s.ctx, s.datumsToConstants(types.MakeDatums("65", "tidb")))
-	c.Assert(err, IsNil)
-	_, err = evalBuiltinFunc(f, chunk.Row{})
-	c.Assert(err.Error(), Equals, "unknown encoding: tidb")
 }
 
 func (s *testEvaluatorSuite) TestCharLength(c *C) {
-	defer testleak.AfterTest(c)()
 	tbl := []struct {
 		input  interface{}
 		result interface{}
@@ -1278,8 +1336,6 @@ func (s *testEvaluatorSuite) TestCharLength(c *C) {
 }
 
 func (s *testEvaluatorSuite) TestFindInSet(c *C) {
-	defer testleak.AfterTest(c)()
-
 	for _, t := range []struct {
 		str    interface{}
 		strlst interface{}
@@ -1307,7 +1363,6 @@ func (s *testEvaluatorSuite) TestFindInSet(c *C) {
 }
 
 func (s *testEvaluatorSuite) TestField(c *C) {
-	defer testleak.AfterTest(c)()
 	stmtCtx := s.ctx.GetSessionVars().StmtCtx
 	origin := stmtCtx.IgnoreTruncate
 	stmtCtx.IgnoreTruncate = true
@@ -1426,7 +1481,7 @@ func (s *testEvaluatorSuite) TestRpadSig(c *C) {
 	}
 
 	base := baseBuiltinFunc{args: args, ctx: s.ctx, tp: resultType}
-	rpad := &builtinRpadSig{base, 1000}
+	rpad := &builtinRpadUTF8Sig{base, 1000}
 
 	input := chunk.NewChunkWithCapacity(colTypes, 10)
 	input.AppendString(0, "abc")
@@ -1469,17 +1524,37 @@ func (s *testEvaluatorSuite) TestInsertBinarySig(c *C) {
 	}
 
 	base := baseBuiltinFunc{args: args, ctx: s.ctx, tp: resultType}
-	insert := &builtinInsertBinarySig{base, 3}
+	insert := &builtinInsertSig{base, 3}
 
 	input := chunk.NewChunkWithCapacity(colTypes, 2)
 	input.AppendString(0, "abc")
 	input.AppendString(0, "abc")
+	input.AppendString(0, "abc")
+	input.AppendNull(0)
+	input.AppendString(0, "abc")
+	input.AppendString(0, "abc")
+	input.AppendString(0, "abc")
+	input.AppendInt64(1, 3)
+	input.AppendInt64(1, 3)
+	input.AppendInt64(1, 0)
+	input.AppendInt64(1, 3)
+	input.AppendNull(1)
 	input.AppendInt64(1, 3)
 	input.AppendInt64(1, 3)
 	input.AppendInt64(2, -1)
+	input.AppendInt64(2, -1)
+	input.AppendInt64(2, -1)
+	input.AppendInt64(2, -1)
+	input.AppendInt64(2, -1)
+	input.AppendNull(2)
 	input.AppendInt64(2, -1)
 	input.AppendString(3, "d")
 	input.AppendString(3, "de")
+	input.AppendString(3, "d")
+	input.AppendString(3, "d")
+	input.AppendString(3, "d")
+	input.AppendString(3, "d")
+	input.AppendNull(3)
 
 	res, isNull, err := insert.evalString(input.GetRow(0))
 	c.Assert(res, Equals, "abd")
@@ -1491,6 +1566,31 @@ func (s *testEvaluatorSuite) TestInsertBinarySig(c *C) {
 	c.Assert(isNull, IsTrue)
 	c.Assert(err, IsNil)
 
+	res, isNull, err = insert.evalString(input.GetRow(2))
+	c.Assert(res, Equals, "abc")
+	c.Assert(isNull, IsFalse)
+	c.Assert(err, IsNil)
+
+	res, isNull, err = insert.evalString(input.GetRow(3))
+	c.Assert(res, Equals, "")
+	c.Assert(isNull, IsTrue)
+	c.Assert(err, IsNil)
+
+	res, isNull, err = insert.evalString(input.GetRow(4))
+	c.Assert(res, Equals, "")
+	c.Assert(isNull, IsTrue)
+	c.Assert(err, IsNil)
+
+	res, isNull, err = insert.evalString(input.GetRow(5))
+	c.Assert(res, Equals, "")
+	c.Assert(isNull, IsTrue)
+	c.Assert(err, IsNil)
+
+	res, isNull, err = insert.evalString(input.GetRow(6))
+	c.Assert(res, Equals, "")
+	c.Assert(isNull, IsTrue)
+	c.Assert(err, IsNil)
+
 	warnings := s.ctx.GetSessionVars().StmtCtx.GetWarnings()
 	c.Assert(len(warnings), Equals, 1)
 	lastWarn := warnings[len(warnings)-1]
@@ -1498,7 +1598,6 @@ func (s *testEvaluatorSuite) TestInsertBinarySig(c *C) {
 }
 
 func (s *testEvaluatorSuite) TestInstr(c *C) {
-	defer testleak.AfterTest(c)()
 	tbl := []struct {
 		Args []interface{}
 		Want interface{}
@@ -1518,11 +1617,11 @@ func (s *testEvaluatorSuite) TestInstr(c *C) {
 		{[]interface{}{"中文美好", "世界"}, 0},
 		{[]interface{}{"中文abc", "a"}, 3},
 
-		{[]interface{}{"live LONG and prosper", "long"}, 6},
+		{[]interface{}{"live long and prosper", "long"}, 6},
 
-		{[]interface{}{"not BINARY string", "binary"}, 5},
-		{[]interface{}{"UPPER case", "upper"}, 1},
-		{[]interface{}{"UPPER case", "CASE"}, 7},
+		{[]interface{}{"not binary string", "binary"}, 5},
+		{[]interface{}{"upper case", "upper"}, 1},
+		{[]interface{}{"UPPER CASE", "CASE"}, 7},
 		{[]interface{}{"中文abc", "abc"}, 3},
 
 		{[]interface{}{"foobar", nil}, nil},
@@ -1543,8 +1642,6 @@ func (s *testEvaluatorSuite) TestInstr(c *C) {
 }
 
 func (s *testEvaluatorSuite) TestMakeSet(c *C) {
-	defer testleak.AfterTest(c)()
-
 	tbl := []struct {
 		argList []interface{}
 		ret     interface{}
@@ -1570,7 +1667,6 @@ func (s *testEvaluatorSuite) TestMakeSet(c *C) {
 }
 
 func (s *testEvaluatorSuite) TestOct(c *C) {
-	defer testleak.AfterTest(c)()
 	octTests := []struct {
 		origin interface{}
 		ret    string
@@ -1592,7 +1688,7 @@ func (s *testEvaluatorSuite) TestOct(c *C) {
 		{1025, "2001"},
 		{"8a8", "10"},
 		{"abc", "0"},
-		//overflow uint64
+		// overflow uint64
 		{"9999999999999999999999999", "1777777777777777777777"},
 		{"-9999999999999999999999999", "1777777777777777777777"},
 		{types.NewBinaryLiteralFromUint(255, -1), "377"}, // b'11111111'
@@ -1619,7 +1715,6 @@ func (s *testEvaluatorSuite) TestOct(c *C) {
 }
 
 func (s *testEvaluatorSuite) TestFormat(c *C) {
-	defer testleak.AfterTest(c)()
 	formatTests := []struct {
 		number    interface{}
 		precision interface{}
@@ -1667,7 +1762,7 @@ func (s *testEvaluatorSuite) TestFormat(c *C) {
 		{"12332.1234567890123456789012345678901", 22, "12,332.1234567890110000000000", 0},
 		{nil, 22, nil, 0},
 		{1, 1024, "1.000000000000000000000000000000", 0},
-		{"", 1, "0.0", 1},
+		{"", 1, "0.0", 0},
 		{1, "", "1", 1},
 	}
 	formatTests2 := struct {
@@ -1675,13 +1770,13 @@ func (s *testEvaluatorSuite) TestFormat(c *C) {
 		precision interface{}
 		locale    string
 		ret       interface{}
-	}{-12332.123456, -4, "zh_CN", nil}
+	}{-12332.123456, -4, "zh_CN", "-12,332"}
 	formatTests3 := struct {
 		number    interface{}
 		precision interface{}
 		locale    string
 		ret       interface{}
-	}{"-12332.123456", "4", "de_GE", nil}
+	}{"-12332.123456", "4", "de_GE", "-12,332.1235"}
 	formatTests4 := struct {
 		number    interface{}
 		precision interface{}
@@ -1712,7 +1807,7 @@ func (s *testEvaluatorSuite) TestFormat(c *C) {
 			warnings := s.ctx.GetSessionVars().StmtCtx.GetWarnings()
 			c.Assert(len(warnings), Equals, tt.warnings, Commentf("test %v", tt))
 			for i := 0; i < tt.warnings; i++ {
-				c.Assert(terror.ErrorEqual(types.ErrTruncated, warnings[i].Err), IsTrue, Commentf("test %v", tt))
+				c.Assert(terror.ErrorEqual(types.ErrTruncatedWrongVal, warnings[i].Err), IsTrue, Commentf("test %v", tt))
 			}
 			s.ctx.GetSessionVars().StmtCtx.SetWarnings([]stmtctx.SQLWarn{})
 		}
@@ -1740,8 +1835,10 @@ func (s *testEvaluatorSuite) TestFormat(c *C) {
 	c.Assert(err, IsNil)
 	c.Assert(r4, testutil.DatumEquals, types.NewDatum(formatTests4.ret))
 	warnings := s.ctx.GetSessionVars().StmtCtx.GetWarnings()
-	c.Assert(len(warnings), Equals, 1)
-	c.Assert(terror.ErrorEqual(errUnknownLocale, warnings[0].Err), IsTrue)
+	c.Assert(len(warnings), Equals, 3)
+	for i := 0; i < 3; i++ {
+		c.Assert(terror.ErrorEqual(errUnknownLocale, warnings[i].Err), IsTrue)
+	}
 	s.ctx.GetSessionVars().StmtCtx.SetWarnings([]stmtctx.SQLWarn{})
 }
 
@@ -1750,27 +1847,27 @@ func (s *testEvaluatorSuite) TestFromBase64(c *C) {
 		args   interface{}
 		expect interface{}
 	}{
-		{string(""), string("")},
-		{string("YWJj"), string("abc")},
-		{string("YWIgYw=="), string("ab c")},
-		{string("YWIKYw=="), string("ab\nc")},
-		{string("YWIJYw=="), string("ab\tc")},
-		{string("cXdlcnR5MTIzNDU2"), string("qwerty123456")},
+		{"", ""},
+		{"YWJj", "abc"},
+		{"YWIgYw==", "ab c"},
+		{"YWIKYw==", "ab\nc"},
+		{"YWIJYw==", "ab\tc"},
+		{"cXdlcnR5MTIzNDU2", "qwerty123456"},
 		{
-			string("QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVphYmNkZWZnaGlqa2xtbm9wcXJzdHV2d3h5ejAxMjM0\nNTY3ODkrL0FCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaYWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4\neXowMTIzNDU2Nzg5Ky9BQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWmFiY2RlZmdoaWprbG1ub3Bx\ncnN0dXZ3eHl6MDEyMzQ1Njc4OSsv"),
-			string("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"),
+			"QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVphYmNkZWZnaGlqa2xtbm9wcXJzdHV2d3h5ejAxMjM0\nNTY3ODkrL0FCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaYWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4\neXowMTIzNDU2Nzg5Ky9BQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWmFiY2RlZmdoaWprbG1ub3Bx\ncnN0dXZ3eHl6MDEyMzQ1Njc4OSsv",
+			"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/",
 		},
 		{
-			string("QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVphYmNkZWZnaGlqa2xtbm9wcXJzdHV2d3h5ejAxMjM0NTY3ODkrLw=="),
-			string("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"),
+			"QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVphYmNkZWZnaGlqa2xtbm9wcXJzdHV2d3h5ejAxMjM0NTY3ODkrLw==",
+			"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/",
 		},
 		{
-			string("QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVphYmNkZWZnaGlqa2xtbm9wcXJzdHV2d3h5ejAxMjM0NTY3ODkrLw=="),
-			string("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"),
+			"QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVphYmNkZWZnaGlqa2xtbm9wcXJzdHV2d3h5ejAxMjM0NTY3ODkrLw==",
+			"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/",
 		},
 		{
-			string("QUJDREVGR0hJSkt\tMTU5PUFFSU1RVVld\nYWVphYmNkZ\rWZnaGlqa2xt   bm9wcXJzdHV2d3h5ejAxMjM0NTY3ODkrLw=="),
-			string("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"),
+			"QUJDREVGR0hJSkt\tMTU5PUFFSU1RVVld\nYWVphYmNkZ\rWZnaGlqa2xt   bm9wcXJzdHV2d3h5ejAxMjM0NTY3ODkrLw==",
+			"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/",
 		},
 	}
 	fc := funcs[ast.FromBase64]
@@ -1800,16 +1897,16 @@ func (s *testEvaluatorSuite) TestFromBase64Sig(c *C) {
 		isNil          bool
 		maxAllowPacket uint64
 	}{
-		{string("YWJj"), string("abc"), false, 3},
-		{string("YWJj"), "", true, 2},
+		{"YWJj", "abc", false, 3},
+		{"YWJj", "", true, 2},
 		{
-			string("QUJDREVGR0hJSkt\tMTU5PUFFSU1RVVld\nYWVphYmNkZ\rWZnaGlqa2xt   bm9wcXJzdHV2d3h5ejAxMjM0NTY3ODkrLw=="),
-			string("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"),
+			"QUJDREVGR0hJSkt\tMTU5PUFFSU1RVVld\nYWVphYmNkZ\rWZnaGlqa2xt   bm9wcXJzdHV2d3h5ejAxMjM0NTY3ODkrLw==",
+			"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/",
 			false,
 			70,
 		},
 		{
-			string("QUJDREVGR0hJSkt\tMTU5PUFFSU1RVVld\nYWVphYmNkZ\rWZnaGlqa2xt   bm9wcXJzdHV2d3h5ejAxMjM0NTY3ODkrLw=="),
+			"QUJDREVGR0hJSkt\tMTU5PUFFSU1RVVld\nYWVphYmNkZ\rWZnaGlqa2xt   bm9wcXJzdHV2d3h5ejAxMjM0NTY3ODkrLw==",
 			"",
 			true,
 			69,
@@ -1855,6 +1952,8 @@ func (s *testEvaluatorSuite) TestInsert(c *C) {
 		{[]interface{}{"Quadratic", 3, 4, nil}, nil},
 		{[]interface{}{"Quadratic", 3, -1, "What"}, "QuWhat"},
 		{[]interface{}{"Quadratic", 3, 1, "What"}, "QuWhatdratic"},
+		{[]interface{}{"Quadratic", -1, nil, "What"}, nil},
+		{[]interface{}{"Quadratic", -1, 4, nil}, nil},
 
 		{[]interface{}{"我叫小雨呀", 3, 2, "王雨叶"}, "我叫王雨叶呀"},
 		{[]interface{}{"我叫小雨呀", -1, 2, "王雨叶"}, "我叫小雨呀"},
@@ -1865,6 +1964,8 @@ func (s *testEvaluatorSuite) TestInsert(c *C) {
 		{[]interface{}{"我叫小雨呀", 3, 4, nil}, nil},
 		{[]interface{}{"我叫小雨呀", 3, -1, "王雨叶"}, "我叫王雨叶"},
 		{[]interface{}{"我叫小雨呀", 3, 1, "王雨叶"}, "我叫王雨叶雨呀"},
+		{[]interface{}{"我叫小雨呀", -1, nil, "王雨叶"}, nil},
+		{[]interface{}{"我叫小雨呀", -1, 2, nil}, nil},
 	}
 	fc := funcs[ast.InsertFunc]
 	for _, test := range tests {
@@ -1883,8 +1984,6 @@ func (s *testEvaluatorSuite) TestInsert(c *C) {
 }
 
 func (s *testEvaluatorSuite) TestOrd(c *C) {
-	defer testleak.AfterTest(c)()
-
 	cases := []struct {
 		args     interface{}
 		expected int64
@@ -1920,13 +2019,11 @@ func (s *testEvaluatorSuite) TestOrd(c *C) {
 			}
 		}
 	}
-	_, err := funcs[ast.Ord].getFunction(s.ctx, []Expression{Zero})
+	_, err := funcs[ast.Ord].getFunction(s.ctx, []Expression{NewZero()})
 	c.Assert(err, IsNil)
 }
 
 func (s *testEvaluatorSuite) TestElt(c *C) {
-	defer testleak.AfterTest(c)()
-
 	tbl := []struct {
 		argLst []interface{}
 		ret    interface{}
@@ -1949,8 +2046,6 @@ func (s *testEvaluatorSuite) TestElt(c *C) {
 }
 
 func (s *testEvaluatorSuite) TestExportSet(c *C) {
-	defer testleak.AfterTest(c)()
-
 	estd := []struct {
 		argLst []interface{}
 		res    string
@@ -1980,8 +2075,6 @@ func (s *testEvaluatorSuite) TestExportSet(c *C) {
 }
 
 func (s *testEvaluatorSuite) TestBin(c *C) {
-	defer testleak.AfterTest(c)()
-
 	tbl := []struct {
 		Input    interface{}
 		Expected interface{}
@@ -2013,8 +2106,6 @@ func (s *testEvaluatorSuite) TestBin(c *C) {
 }
 
 func (s *testEvaluatorSuite) TestQuote(c *C) {
-	defer testleak.AfterTest(c)()
-
 	tbl := []struct {
 		arg interface{}
 		ret interface{}
@@ -2028,7 +2119,7 @@ func (s *testEvaluatorSuite) TestQuote(c *C) {
 		{`萌萌哒(๑•ᴗ•๑)😊`, `'萌萌哒(๑•ᴗ•๑)😊'`},
 		{`㍿㌍㍑㌫`, `'㍿㌍㍑㌫'`},
 		{string([]byte{0, 26}), `'\0\Z'`},
-		{nil, nil},
+		{nil, "NULL"},
 	}
 
 	for _, t := range tbl {
@@ -2043,8 +2134,6 @@ func (s *testEvaluatorSuite) TestQuote(c *C) {
 }
 
 func (s *testEvaluatorSuite) TestToBase64(c *C) {
-	defer testleak.AfterTest(c)()
-
 	tests := []struct {
 		args   interface{}
 		expect string
@@ -2109,7 +2198,7 @@ func (s *testEvaluatorSuite) TestToBase64(c *C) {
 		}
 	}
 
-	_, err := funcs[ast.ToBase64].getFunction(s.ctx, []Expression{Zero})
+	_, err := funcs[ast.ToBase64].getFunction(s.ctx, []Expression{NewZero()})
 	c.Assert(err, IsNil)
 }
 
@@ -2182,7 +2271,6 @@ func (s *testEvaluatorSuite) TestToBase64Sig(c *C) {
 }
 
 func (s *testEvaluatorSuite) TestStringRight(c *C) {
-	defer testleak.AfterTest(c)()
 	fc := funcs[ast.Right]
 	tests := []struct {
 		str    interface{}
@@ -2211,4 +2299,151 @@ func (s *testEvaluatorSuite) TestStringRight(c *C) {
 		c.Assert(err, IsNil)
 		c.Assert(res, Equals, test.expect)
 	}
+}
+
+func (s *testEvaluatorSuite) TestWeightString(c *C) {
+	fc := funcs[ast.WeightString]
+	tests := []struct {
+		expr    interface{}
+		padding string
+		length  int
+		expect  interface{}
+	}{
+		{nil, "NONE", 0, nil},
+		{7, "NONE", 0, nil},
+		{7.0, "NONE", 0, nil},
+		{"a", "NONE", 0, "a"},
+		{"a ", "NONE", 0, "a "},
+		{"中", "NONE", 0, "中"},
+		{"中 ", "NONE", 0, "中 "},
+		{nil, "CHAR", 5, nil},
+		{7, "CHAR", 5, nil},
+		{7.0, "NONE", 0, nil},
+		{"a", "CHAR", 5, "a    "},
+		{"a ", "CHAR", 5, "a    "},
+		{"中", "CHAR", 5, "中    "},
+		{"中 ", "CHAR", 5, "中    "},
+		{nil, "BINARY", 5, nil},
+		{7, "BINARY", 2, "7\x00"},
+		{7.0, "NONE", 0, nil},
+		{"a", "BINARY", 1, "a"},
+		{"ab", "BINARY", 1, "a"},
+		{"a", "BINARY", 5, "a\x00\x00\x00\x00"},
+		{"a ", "BINARY", 5, "a \x00\x00\x00"},
+		{"中", "BINARY", 1, "\xe4"},
+		{"中", "BINARY", 2, "\xe4\xb8"},
+		{"中", "BINARY", 3, "中"},
+		{"中", "BINARY", 5, "中\x00\x00"},
+	}
+
+	for _, test := range tests {
+		str := types.NewDatum(test.expr)
+		var f builtinFunc
+		var err error
+		if test.padding == "NONE" {
+			f, err = fc.getFunction(s.ctx, s.datumsToConstants([]types.Datum{str}))
+		} else {
+			padding := types.NewDatum(test.padding)
+			length := types.NewDatum(test.length)
+			f, err = fc.getFunction(s.ctx, s.datumsToConstants([]types.Datum{str, padding, length}))
+		}
+		c.Assert(err, IsNil)
+		// Reset warnings.
+		s.ctx.GetSessionVars().StmtCtx.ResetForRetry()
+		result, err := evalBuiltinFunc(f, chunk.Row{})
+		c.Assert(err, IsNil)
+		if result.IsNull() {
+			c.Assert(test.expect, IsNil)
+			continue
+		}
+		res, err := result.ToString()
+		c.Assert(err, IsNil)
+		c.Assert(res, Equals, test.expect)
+		if test.expr == nil {
+			continue
+		}
+		strExpr := fmt.Sprintf("%v", test.expr)
+		if test.padding == "BINARY" && test.length < len(strExpr) {
+			expectWarn := fmt.Sprintf("[expression:1292]Truncated incorrect BINARY(%d) value: '%s'", test.length, strExpr)
+			obtainedWarns := s.ctx.GetSessionVars().StmtCtx.GetWarnings()
+			c.Assert(len(obtainedWarns), Equals, 1)
+			c.Assert(obtainedWarns[0].Level, Equals, "Warning")
+			c.Assert(obtainedWarns[0].Err.Error(), Equals, expectWarn)
+		}
+	}
+}
+
+func (s *testEvaluatorSerialSuites) TestCIWeightString(c *C) {
+	collate.SetNewCollationEnabledForTest(true)
+	defer collate.SetNewCollationEnabledForTest(false)
+
+	type weightStringTest struct {
+		str     string
+		padding string
+		length  int
+		expect  interface{}
+	}
+
+	checkResult := func(collation string, tests []weightStringTest) {
+		fc := funcs[ast.WeightString]
+		for _, test := range tests {
+			str := types.NewCollationStringDatum(test.str, collation, utf8.RuneCountInString(test.str))
+			var f builtinFunc
+			var err error
+			if test.padding == "NONE" {
+				f, err = fc.getFunction(s.ctx, s.datumsToConstants([]types.Datum{str}))
+			} else {
+				padding := types.NewDatum(test.padding)
+				length := types.NewDatum(test.length)
+				f, err = fc.getFunction(s.ctx, s.datumsToConstants([]types.Datum{str, padding, length}))
+			}
+			c.Assert(err, IsNil)
+			result, err := evalBuiltinFunc(f, chunk.Row{})
+			c.Assert(err, IsNil)
+			if result.IsNull() {
+				c.Assert(test.expect, IsNil)
+				continue
+			}
+			res, err := result.ToString()
+			c.Assert(err, IsNil)
+			c.Assert(res, Equals, test.expect)
+		}
+	}
+
+	generalTests := []weightStringTest{
+		{"aAÁàãăâ", "NONE", 0, "\x00A\x00A\x00A\x00A\x00A\x00A\x00A"},
+		{"中", "NONE", 0, "\x4E\x2D"},
+		{"a", "CHAR", 5, "\x00A"},
+		{"a ", "CHAR", 5, "\x00A"},
+		{"中", "CHAR", 5, "\x4E\x2D"},
+		{"中 ", "CHAR", 5, "\x4E\x2D"},
+		{"a", "BINARY", 1, "a"},
+		{"ab", "BINARY", 1, "a"},
+		{"a", "BINARY", 5, "a\x00\x00\x00\x00"},
+		{"a ", "BINARY", 5, "a \x00\x00\x00"},
+		{"中", "BINARY", 1, "\xe4"},
+		{"中", "BINARY", 2, "\xe4\xb8"},
+		{"中", "BINARY", 3, "中"},
+		{"中", "BINARY", 5, "中\x00\x00"},
+	}
+
+	unicodeTests := []weightStringTest{
+		{"aAÁàãăâ", "NONE", 0, "\x0e3\x0e3\x0e3\x0e3\x0e3\x0e3\x0e3"},
+		{"中", "NONE", 0, "\xfb\x40\xce\x2d"},
+		{"a", "CHAR", 5, "\x0e3"},
+		{"a ", "CHAR", 5, "\x0e3"},
+		{"中", "CHAR", 5, "\xfb\x40\xce\x2d"},
+		{"中 ", "CHAR", 5, "\xfb\x40\xce\x2d"},
+		{"a", "BINARY", 1, "a"},
+		{"ab", "BINARY", 1, "a"},
+		{"a", "BINARY", 5, "a\x00\x00\x00\x00"},
+		{"a ", "BINARY", 5, "a \x00\x00\x00"},
+		{"中", "BINARY", 1, "\xe4"},
+		{"中", "BINARY", 2, "\xe4\xb8"},
+		{"中", "BINARY", 3, "中"},
+		{"中", "BINARY", 5, "中\x00\x00"},
+	}
+
+	checkResult("utf8mb4_general_ci", generalTests)
+	checkResult("utf8mb4_unicode_ci", unicodeTests)
 }

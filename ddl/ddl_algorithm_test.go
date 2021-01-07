@@ -22,51 +22,57 @@ import (
 var _ = Suite(&testDDLAlgorithmSuite{})
 
 var (
-	allAlgorithm = []ast.AlterAlgorithm{ast.AlterAlgorithmCopy,
-		ast.AlterAlgorithmInplace, ast.AlterAlgorithmInstant}
+	allAlgorithm = []ast.AlgorithmType{ast.AlgorithmTypeCopy,
+		ast.AlgorithmTypeInplace, ast.AlgorithmTypeInstant}
 )
 
 type testDDLAlgorithmSuite struct{}
 
 type testCase struct {
 	alterSpec          ast.AlterTableSpec
-	supportedAlgorithm []ast.AlterAlgorithm
-	defAlgorithm       ast.AlterAlgorithm
+	supportedAlgorithm []ast.AlgorithmType
+	expectedAlgorithm  []ast.AlgorithmType
 }
 
 func (s *testDDLAlgorithmSuite) TestFindAlterAlgorithm(c *C) {
-	instantAlgorithm := []ast.AlterAlgorithm{ast.AlterAlgorithmInstant}
-	inplaceAlgorithm := []ast.AlterAlgorithm{ast.AlterAlgorithmInplace}
+	supportedInstantAlgorithms := []ast.AlgorithmType{ast.AlgorithmTypeDefault, ast.AlgorithmTypeCopy, ast.AlgorithmTypeInplace, ast.AlgorithmTypeInstant}
+	expectedInstantAlgorithms := []ast.AlgorithmType{ast.AlgorithmTypeInstant, ast.AlgorithmTypeInstant, ast.AlgorithmTypeInstant, ast.AlgorithmTypeInstant}
 
 	testCases := []testCase{
-		{ast.AlterTableSpec{Tp: ast.AlterTableAddConstraint}, inplaceAlgorithm, ast.AlterAlgorithmInplace},
-		{ast.AlterTableSpec{Tp: ast.AlterTableAddColumns}, instantAlgorithm, ast.AlterAlgorithmInstant},
-		{ast.AlterTableSpec{Tp: ast.AlterTableDropColumn}, instantAlgorithm, ast.AlterAlgorithmInstant},
-		{ast.AlterTableSpec{Tp: ast.AlterTableDropPrimaryKey}, instantAlgorithm, ast.AlterAlgorithmInstant},
-		{ast.AlterTableSpec{Tp: ast.AlterTableDropIndex}, instantAlgorithm, ast.AlterAlgorithmInstant},
-		{ast.AlterTableSpec{Tp: ast.AlterTableDropForeignKey}, instantAlgorithm, ast.AlterAlgorithmInstant},
-		{ast.AlterTableSpec{Tp: ast.AlterTableRenameTable}, instantAlgorithm, ast.AlterAlgorithmInstant},
-		{ast.AlterTableSpec{Tp: ast.AlterTableRenameIndex}, instantAlgorithm, ast.AlterAlgorithmInstant},
+		{
+			ast.AlterTableSpec{Tp: ast.AlterTableAddConstraint},
+			[]ast.AlgorithmType{ast.AlgorithmTypeDefault, ast.AlgorithmTypeCopy, ast.AlgorithmTypeInplace},
+			[]ast.AlgorithmType{ast.AlgorithmTypeInplace, ast.AlgorithmTypeInplace, ast.AlgorithmTypeInplace},
+		},
+
+		{ast.AlterTableSpec{Tp: ast.AlterTableAddColumns}, supportedInstantAlgorithms, expectedInstantAlgorithms},
+		{ast.AlterTableSpec{Tp: ast.AlterTableDropColumn}, supportedInstantAlgorithms, expectedInstantAlgorithms},
+		{ast.AlterTableSpec{Tp: ast.AlterTableDropPrimaryKey}, supportedInstantAlgorithms, expectedInstantAlgorithms},
+		{ast.AlterTableSpec{Tp: ast.AlterTableDropIndex}, supportedInstantAlgorithms, expectedInstantAlgorithms},
+		{ast.AlterTableSpec{Tp: ast.AlterTableDropForeignKey}, supportedInstantAlgorithms, expectedInstantAlgorithms},
+		{ast.AlterTableSpec{Tp: ast.AlterTableRenameTable}, supportedInstantAlgorithms, expectedInstantAlgorithms},
+		{ast.AlterTableSpec{Tp: ast.AlterTableRenameIndex}, supportedInstantAlgorithms, expectedInstantAlgorithms},
 
 		// Alter table options.
-		{ast.AlterTableSpec{Tp: ast.AlterTableOption, Options: []*ast.TableOption{{Tp: ast.TableOptionShardRowID}}}, instantAlgorithm, ast.AlterAlgorithmInstant},
-		{ast.AlterTableSpec{Tp: ast.AlterTableOption, Options: []*ast.TableOption{{Tp: ast.TableOptionAutoIncrement}}}, instantAlgorithm, ast.AlterAlgorithmInstant},
-		{ast.AlterTableSpec{Tp: ast.AlterTableOption, Options: []*ast.TableOption{{Tp: ast.TableOptionComment}}}, instantAlgorithm, ast.AlterAlgorithmInstant},
-		{ast.AlterTableSpec{Tp: ast.AlterTableOption, Options: []*ast.TableOption{{Tp: ast.TableOptionCharset}}}, instantAlgorithm, ast.AlterAlgorithmInstant},
-		{ast.AlterTableSpec{Tp: ast.AlterTableOption, Options: []*ast.TableOption{{Tp: ast.TableOptionCollate}}}, instantAlgorithm, ast.AlterAlgorithmInstant},
+		{ast.AlterTableSpec{Tp: ast.AlterTableOption, Options: []*ast.TableOption{{Tp: ast.TableOptionShardRowID}}}, supportedInstantAlgorithms, expectedInstantAlgorithms},
+		{ast.AlterTableSpec{Tp: ast.AlterTableOption, Options: []*ast.TableOption{{Tp: ast.TableOptionAutoIncrement}}}, supportedInstantAlgorithms, expectedInstantAlgorithms},
+		{ast.AlterTableSpec{Tp: ast.AlterTableOption, Options: []*ast.TableOption{{Tp: ast.TableOptionComment}}}, supportedInstantAlgorithms, expectedInstantAlgorithms},
+		{ast.AlterTableSpec{Tp: ast.AlterTableOption, Options: []*ast.TableOption{{Tp: ast.TableOptionCharset}}}, supportedInstantAlgorithms, expectedInstantAlgorithms},
+		{ast.AlterTableSpec{Tp: ast.AlterTableOption, Options: []*ast.TableOption{{Tp: ast.TableOptionCollate}}}, supportedInstantAlgorithms, expectedInstantAlgorithms},
 
 		// TODO: after we support migrate the data of partitions, change below cases.
-		{ast.AlterTableSpec{Tp: ast.AlterTableCoalescePartitions}, instantAlgorithm, ast.AlterAlgorithmInstant},
-		{ast.AlterTableSpec{Tp: ast.AlterTableAddPartitions}, instantAlgorithm, ast.AlterAlgorithmInstant},
-		{ast.AlterTableSpec{Tp: ast.AlterTableDropPartition}, instantAlgorithm, ast.AlterAlgorithmInstant},
-		{ast.AlterTableSpec{Tp: ast.AlterTableTruncatePartition}, instantAlgorithm, ast.AlterAlgorithmInstant},
+		{ast.AlterTableSpec{Tp: ast.AlterTableCoalescePartitions}, supportedInstantAlgorithms, expectedInstantAlgorithms},
+		{ast.AlterTableSpec{Tp: ast.AlterTableAddPartitions}, supportedInstantAlgorithms, expectedInstantAlgorithms},
+		{ast.AlterTableSpec{Tp: ast.AlterTableDropPartition}, supportedInstantAlgorithms, expectedInstantAlgorithms},
+		{ast.AlterTableSpec{Tp: ast.AlterTableTruncatePartition}, supportedInstantAlgorithms, expectedInstantAlgorithms},
+		{ast.AlterTableSpec{Tp: ast.AlterTableExchangePartition}, supportedInstantAlgorithms, expectedInstantAlgorithms},
 
 		// TODO: after we support lock a table, change the below case.
-		{ast.AlterTableSpec{Tp: ast.AlterTableLock}, instantAlgorithm, ast.AlterAlgorithmInstant},
+		{ast.AlterTableSpec{Tp: ast.AlterTableLock}, supportedInstantAlgorithms, expectedInstantAlgorithms},
 		// TODO: after we support changing the column type, below cases need to change.
-		{ast.AlterTableSpec{Tp: ast.AlterTableModifyColumn}, instantAlgorithm, ast.AlterAlgorithmInstant},
-		{ast.AlterTableSpec{Tp: ast.AlterTableChangeColumn}, instantAlgorithm, ast.AlterAlgorithmInstant},
-		{ast.AlterTableSpec{Tp: ast.AlterTableAlterColumn}, instantAlgorithm, ast.AlterAlgorithmInstant},
+		{ast.AlterTableSpec{Tp: ast.AlterTableModifyColumn}, supportedInstantAlgorithms, expectedInstantAlgorithms},
+		{ast.AlterTableSpec{Tp: ast.AlterTableChangeColumn}, supportedInstantAlgorithms, expectedInstantAlgorithms},
+		{ast.AlterTableSpec{Tp: ast.AlterTableAlterColumn}, supportedInstantAlgorithms, expectedInstantAlgorithms},
 	}
 
 	for _, tc := range testCases {
@@ -75,11 +81,7 @@ func (s *testDDLAlgorithmSuite) TestFindAlterAlgorithm(c *C) {
 }
 
 func runAlterAlgorithmTestCases(c *C, tc *testCase) {
-	algorithm, err := ddl.ResolveAlterAlgorithm(&tc.alterSpec, ast.AlterAlgorithmDefault)
-	c.Assert(err, IsNil)
-	c.Assert(algorithm, Equals, tc.defAlgorithm)
-
-	unsupported := make([]ast.AlterAlgorithm, 0, len(allAlgorithm))
+	unsupported := make([]ast.AlgorithmType, 0, len(allAlgorithm))
 Loop:
 	for _, alm := range allAlgorithm {
 		for _, almSupport := range tc.supportedAlgorithm {
@@ -91,16 +93,22 @@ Loop:
 		unsupported = append(unsupported, alm)
 	}
 
+	var algorithm ast.AlgorithmType
+	var err error
+
 	// Test supported.
-	for _, alm := range tc.supportedAlgorithm {
+	for i, alm := range tc.supportedAlgorithm {
 		algorithm, err = ddl.ResolveAlterAlgorithm(&tc.alterSpec, alm)
-		c.Assert(err, IsNil)
-		c.Assert(algorithm, Equals, alm)
+		if err != nil {
+			c.Assert(ddl.ErrAlterOperationNotSupported.Equal(err), IsTrue)
+		}
+		c.Assert(algorithm, Equals, tc.expectedAlgorithm[i])
 	}
 
 	// Test unsupported.
 	for _, alm := range unsupported {
-		_, err = ddl.ResolveAlterAlgorithm(&tc.alterSpec, alm)
+		algorithm, err = ddl.ResolveAlterAlgorithm(&tc.alterSpec, alm)
+		c.Assert(algorithm, Equals, ast.AlgorithmTypeDefault)
 		c.Assert(err, NotNil, Commentf("Tp:%v, alm:%s", tc.alterSpec.Tp, alm))
 		c.Assert(ddl.ErrAlterOperationNotSupported.Equal(err), IsTrue)
 	}

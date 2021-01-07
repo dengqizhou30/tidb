@@ -8,9 +8,9 @@
 [![GitHub release date](https://img.shields.io/github/release-date/pingcap/tidb.svg)](https://github.com/pingcap/tidb/releases)
 [![CircleCI Status](https://circleci.com/gh/pingcap/tidb.svg?style=shield)](https://circleci.com/gh/pingcap/tidb)
 [![Coverage Status](https://codecov.io/gh/pingcap/tidb/branch/master/graph/badge.svg)](https://codecov.io/gh/pingcap/tidb)
+[![GoDoc](https://img.shields.io/badge/Godoc-reference-blue.svg)](https://godoc.org/github.com/pingcap/tidb)
 
-- [**Stack Overflow**](https://stackoverflow.com/questions/tagged/tidb)
-- Community [**Slack Channel**](https://pingcap.com/tidbslack/)
+- [**Slack Channel**](https://slack.tidb.io)
 - **Twitter**: [@PingCAP](https://twitter.com/PingCAP)
 - [**Reddit**](https://www.reddit.com/r/TiDB/)
 - **Mailing list**: [Google Group](https://groups.google.com/forum/#!forum/tidb-user)
@@ -27,7 +27,7 @@ TiDB ("Ti" stands for Titanium) is an open-source NewSQL database that supports 
 
 - __MySQL Compatible Syntax__
 
-    TiDB acts like it is a MySQL 5.7 server to your applications. You can continue to use all of the existing MySQL client libraries, and in many cases, you will not need to change a single line of code in your application. Because TiDB is built from scratch, not a MySQL fork, please check out the list of [known compatibility differences](https://www.pingcap.com/docs/sql/mysql-compatibility/).
+    TiDB acts like it is a MySQL 5.7 server to your applications. You can continue to use all of the existing MySQL client libraries, and in many cases, you will not need to change a single line of code in your application. Because TiDB is built from scratch, not a MySQL fork, please check out the list of [known compatibility differences](https://pingcap.com/docs/v3.0/reference/mysql-compatibility/).
 
 - __Distributed Transactions with Strong Consistency__
 
@@ -49,6 +49,22 @@ TiDB ("Ti" stands for Titanium) is an open-source NewSQL database that supports 
 
 For more details and latest updates, see [official TiDB blog](https://www.pingcap.com/blog/).
 
+
+## Quick start
+
+
+See [Quick Start Guide](https://pingcap.com/docs/stable/quick-start-with-tidb/ ), which includes deployment methods using TiUP, Ansible, Docker, and Kubernetes.
+
+### To start developing TiDB
+
+The [community repository](https://github.com/pingcap/community) hosts all information about the TiDB community, including how to contribute to TiDB, how TiDB community is governed,  how special interest groups are organized, etc.
+
+[<img src="docs/contribution-map.png" alt="contribution-map" width="180">](https://github.com/pingcap/tidb-map/blob/master/maps/contribution-map.md#tidb-is-an-open-source-distributed-htap-database-compatible-with-the-mysql-protocol)
+
+Contributions are welcomed and greatly appreciated. See
+[Contribution Guide](https://github.com/pingcap/community/blob/master/contributors/README.md)
+for details on submitting patches and the contribution workflow. For more contributing information, click on the contributor icon above.
+
 ## Adopters
 
 View the current list of in-production TiDB adopters [here](https://pingcap.com/docs/adopters/).
@@ -57,9 +73,11 @@ View the current list of in-production TiDB adopters [here](https://pingcap.com/
 
 Read the [Roadmap](https://pingcap.com/docs/ROADMAP).
 
-## Quick start
 
-Read the [Quick Start Guide](https://pingcap.com/docs/QUICKSTART), which includes deployment methods using Ansible, Docker, and Kubernetes.
+## Getting Help
+
+- [**Stack Overflow**](https://stackoverflow.com/questions/tagged/tidb)
+- [**User Group (Chinese)**](https://asktug.com)
 
 ## Documentation
 
@@ -69,10 +87,6 @@ Read the [Quick Start Guide](https://pingcap.com/docs/QUICKSTART), which include
 ## Architecture
 
 ![architecture](./docs/architecture.png)
-
-## Contributing
-Contributions are welcomed and greatly appreciated. See [CONTRIBUTING.md](CONTRIBUTING.md)
-for details on submitting patches and the contribution workflow.
 
 ## License
 TiDB is under the Apache 2.0 license. See the [LICENSE](./LICENSE) file for details.

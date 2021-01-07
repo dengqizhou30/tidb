@@ -29,16 +29,17 @@ import (
 type Scanner struct {
 	snapshot     *tikvSnapshot
 	batchSize    int
-	valid        bool
 	cache        []*pb.KvPair
 	idx          int
-	nextStartKey []byte
-	endKey       []byte
-	eof          bool
+	nextStartKey kv.Key
+	endKey       kv.Key
 
 	// Use for reverse scan.
+	nextEndKey kv.Key
 	reverse    bool
-	nextEndKey []byte
+
+	valid bool
+	eof   bool
 }
 
 func newScanner(snapshot *tikvSnapshot, startKey []byte, endKey []byte, batchSize int, reverse bool) (*Scanner, error) {
@@ -85,7 +86,7 @@ func (s *Scanner) Value() []byte {
 
 // Next return next element.
 func (s *Scanner) Next() error {
-	bo := NewBackoffer(context.WithValue(context.Background(), txnStartKey, s.snapshot.version.Ver), scannerNextMaxBackoff)
+	bo := NewBackofferWithVars(context.WithValue(context.Background(), txnStartKey, s.snapshot.version.Ver), scannerNextMaxBackoff, s.snapshot.vars)
 	if !s.valid {
 		return errors.New("scanner iterator is invalid")
 	}
@@ -108,8 +109,8 @@ func (s *Scanner) Next() error {
 		}
 
 		current := s.cache[s.idx]
-		if (!s.reverse && (len(s.endKey) > 0 && kv.Key(current.Key).Cmp(kv.Key(s.endKey)) >= 0)) ||
-			(s.reverse && len(s.nextStartKey) > 0 && kv.Key(current.Key).Cmp(kv.Key(s.nextStartKey)) < 0) {
+		if (!s.reverse && (len(s.endKey) > 0 && kv.Key(current.Key).Cmp(s.endKey) >= 0)) ||
+			(s.reverse && len(s.nextStartKey) > 0 && kv.Key(current.Key).Cmp(s.nextStartKey) < 0) {
 			s.eof = true
 			s.Close()
 			return nil
@@ -143,7 +144,8 @@ func (s *Scanner) startTS() uint64 {
 }
 
 func (s *Scanner) resolveCurrentLock(bo *Backoffer, current *pb.KvPair) error {
-	val, err := s.snapshot.get(bo, kv.Key(current.Key))
+	ctx := context.Background()
+	val, err := s.snapshot.get(ctx, bo, current.Key)
 	if err != nil {
 		return errors.Trace(err)
 	}
@@ -154,8 +156,8 @@ func (s *Scanner) resolveCurrentLock(bo *Backoffer, current *pb.KvPair) error {
 
 func (s *Scanner) getData(bo *Backoffer) error {
 	logutil.BgLogger().Debug("txn getData",
-		zap.Binary("nextStartKey", s.nextStartKey),
-		zap.Binary("nextEndKey", s.nextEndKey),
+		zap.Stringer("nextStartKey", s.nextStartKey),
+		zap.Stringer("nextEndKey", s.nextEndKey),
 		zap.Bool("reverse", s.reverse),
 		zap.Uint64("txnStartTS", s.startTS()))
 	sender := NewRegionRequestSender(s.snapshot.store.regionCache, s.snapshot.store.client)
@@ -184,26 +186,31 @@ func (s *Scanner) getData(bo *Backoffer) error {
 				reqStartKey = loc.StartKey
 			}
 		}
-
-		req := &tikvrpc.Request{
-			Type: tikvrpc.CmdScan,
-			Scan: &pb.ScanRequest{
-				StartKey: s.nextStartKey,
-				EndKey:   reqEndKey,
-				Limit:    uint32(s.batchSize),
-				Version:  s.startTS(),
-				KeyOnly:  s.snapshot.keyOnly,
+		sreq := &pb.ScanRequest{
+			Context: &pb.Context{
+				Priority:       s.snapshot.priority,
+				NotFillCache:   s.snapshot.notFillCache,
+				IsolationLevel: pbIsolationLevel(s.snapshot.isolationLevel),
 			},
-			Context: pb.Context{
-				Priority:     s.snapshot.priority,
-				NotFillCache: s.snapshot.notFillCache,
-			},
+			StartKey:   s.nextStartKey,
+			EndKey:     reqEndKey,
+			Limit:      uint32(s.batchSize),
+			Version:    s.startTS(),
+			KeyOnly:    s.snapshot.keyOnly,
+			SampleStep: s.snapshot.sampleStep,
 		}
 		if s.reverse {
-			req.Scan.StartKey = s.nextEndKey
-			req.Scan.EndKey = reqStartKey
-			req.Scan.Reverse = true
+			sreq.StartKey = s.nextEndKey
+			sreq.EndKey = reqStartKey
+			sreq.Reverse = true
 		}
+		s.snapshot.mu.RLock()
+		req := tikvrpc.NewReplicaReadRequest(tikvrpc.CmdScan, sreq, s.snapshot.mu.replicaRead, &s.snapshot.replicaReadSeed, pb.Context{
+			Priority:     s.snapshot.priority,
+			NotFillCache: s.snapshot.notFillCache,
+			TaskId:       s.snapshot.mu.taskID,
+		})
+		s.snapshot.mu.RUnlock()
 		resp, err := sender.SendReq(bo, req, loc.Region, ReadTimeoutMedium)
 		if err != nil {
 			return errors.Trace(err)
@@ -221,20 +228,40 @@ func (s *Scanner) getData(bo *Backoffer) error {
 			}
 			continue
 		}
-		cmdScanResp := resp.Scan
-		if cmdScanResp == nil {
+		if resp.Resp == nil {
 			return errors.Trace(ErrBodyMissing)
 		}
+		cmdScanResp := resp.Resp.(*pb.ScanResponse)
 
 		err = s.snapshot.store.CheckVisibility(s.startTS())
 		if err != nil {
 			return errors.Trace(err)
 		}
 
+		// When there is a response-level key error, the returned pairs are incomplete.
+		// We should resolve the lock first and then retry the same request.
+		if keyErr := cmdScanResp.GetError(); keyErr != nil {
+			lock, err := extractLockFromKeyErr(keyErr)
+			if err != nil {
+				return errors.Trace(err)
+			}
+			msBeforeExpired, _, err := newLockResolver(s.snapshot.store).ResolveLocks(bo, s.snapshot.version.Ver, []*Lock{lock})
+			if err != nil {
+				return errors.Trace(err)
+			}
+			if msBeforeExpired > 0 {
+				err = bo.BackoffWithMaxSleep(boTxnLockFast, int(msBeforeExpired), errors.Errorf("key is locked during scanning"))
+				if err != nil {
+					return errors.Trace(err)
+				}
+			}
+			continue
+		}
+
 		kvPairs := cmdScanResp.Pairs
 		// Check if kvPair contains error, it should be a Lock.
 		for _, pair := range kvPairs {
-			if keyErr := pair.GetError(); keyErr != nil {
+			if keyErr := pair.GetError(); keyErr != nil && len(pair.Key) == 0 {
 				lock, err := extractLockFromKeyErr(keyErr)
 				if err != nil {
 					return errors.Trace(err)
@@ -252,8 +279,8 @@ func (s *Scanner) getData(bo *Backoffer) error {
 			} else {
 				s.nextEndKey = reqStartKey
 			}
-			if (!s.reverse && (len(loc.EndKey) == 0 || (len(s.endKey) > 0 && kv.Key(s.nextStartKey).Cmp(kv.Key(s.endKey)) >= 0))) ||
-				(s.reverse && (len(loc.StartKey) == 0 || (len(s.nextStartKey) > 0 && kv.Key(s.nextStartKey).Cmp(kv.Key(s.nextEndKey)) >= 0))) {
+			if (!s.reverse && (len(loc.EndKey) == 0 || (len(s.endKey) > 0 && s.nextStartKey.Cmp(s.endKey) >= 0))) ||
+				(s.reverse && (len(loc.StartKey) == 0 || (len(s.nextStartKey) > 0 && s.nextStartKey.Cmp(s.nextEndKey) >= 0))) {
 				// Current Region is the last one.
 				s.eof = true
 			}
@@ -267,7 +294,7 @@ func (s *Scanner) getData(bo *Backoffer) error {
 		if !s.reverse {
 			s.nextStartKey = kv.Key(lastKey).Next()
 		} else {
-			s.nextEndKey = kv.Key(lastKey)
+			s.nextEndKey = lastKey
 		}
 		return nil
 	}

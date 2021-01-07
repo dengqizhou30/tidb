@@ -18,18 +18,21 @@ import (
 )
 
 // OneByOneSuite is a suite, When with-tikv flag is true, there is only one storage, so the test suite have to run one by one.
-type OneByOneSuite struct {
-}
+type OneByOneSuite struct{}
 
-func (s OneByOneSuite) SetUpSuite(c *C) {
-	if *withTiKV {
+func (s *OneByOneSuite) SetUpSuite(c *C) {
+	if *WithTiKV {
 		withTiKVGlobalLock.Lock()
+	} else {
+		withTiKVGlobalLock.RLock()
 	}
 }
 
-func (s OneByOneSuite) TearDownSuite(c *C) {
-	if *withTiKV {
+func (s *OneByOneSuite) TearDownSuite(c *C) {
+	if *WithTiKV {
 		withTiKVGlobalLock.Unlock()
+	} else {
+		withTiKVGlobalLock.RUnlock()
 	}
 }
 

@@ -17,8 +17,8 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/pingcap/parser/mysql"
-	"github.com/pingcap/parser/terror"
+	"github.com/pingcap/tidb/errno"
+	"github.com/pingcap/tidb/util/dbterror"
 	"github.com/pingcap/tidb/util/logutil"
 	"go.uber.org/zap"
 )
@@ -32,10 +32,42 @@ type ActionOnExceed interface {
 	// SetLogHook binds a log hook which will be triggered and log an detailed
 	// message for the out-of-memory sql.
 	SetLogHook(hook func(uint64))
+	// SetFallback sets a fallback action which will be triggered if itself has
+	// already been triggered.
+	SetFallback(a ActionOnExceed)
+	// GetFallback get the fallback action of the Action.
+	GetFallback() ActionOnExceed
+	// GetPriority get the priority of the Action.
+	GetPriority() int64
 }
+
+// BaseOOMAction manages the fallback action for all Action.
+type BaseOOMAction struct {
+	fallbackAction ActionOnExceed
+}
+
+// SetFallback sets a fallback action which will be triggered if itself has
+// already been triggered.
+func (b *BaseOOMAction) SetFallback(a ActionOnExceed) {
+	b.fallbackAction = a
+}
+
+// GetFallback get the fallback action of the Action.
+func (b *BaseOOMAction) GetFallback() ActionOnExceed {
+	return b.fallbackAction
+}
+
+// Default OOM Action priority.
+const (
+	DefPanicPriority = iota
+	DefLogPriority
+	DefSpillPriority
+	DefRateLimitPriority
+)
 
 // LogOnExceed logs a warning only once when memory usage exceeds memory quota.
 type LogOnExceed struct {
+	BaseOOMAction
 	mutex   sync.Mutex // For synchronization.
 	acted   bool
 	ConnID  uint64
@@ -62,8 +94,14 @@ func (a *LogOnExceed) Action(t *Tracker) {
 	}
 }
 
+// GetPriority get the priority of the Action
+func (a *LogOnExceed) GetPriority() int64 {
+	return DefLogPriority
+}
+
 // PanicOnExceed panics when memory usage exceeds memory quota.
 type PanicOnExceed struct {
+	BaseOOMAction
 	mutex   sync.Mutex // For synchronization.
 	acted   bool
 	ConnID  uint64
@@ -90,13 +128,16 @@ func (a *PanicOnExceed) Action(t *Tracker) {
 	panic(PanicMemoryExceed + fmt.Sprintf("[conn_id=%d]", a.ConnID))
 }
 
+// GetPriority get the priority of the Action
+func (a *PanicOnExceed) GetPriority() int64 {
+	return DefPanicPriority
+}
+
 var (
-	errMemExceedThreshold = terror.ClassExecutor.New(codeMemExceedThreshold, mysql.MySQLErrName[mysql.ErrMemExceedThreshold])
+	errMemExceedThreshold = dbterror.ClassUtil.NewStd(errno.ErrMemExceedThreshold)
 )
 
 const (
-	codeMemExceedThreshold terror.ErrCode = 8001
-
 	// PanicMemoryExceed represents the panic message when out of memory quota.
 	PanicMemoryExceed string = "Out Of Memory Quota!"
 )

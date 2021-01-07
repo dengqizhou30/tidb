@@ -16,6 +16,7 @@ package codec
 import (
 	"github.com/pingcap/errors"
 	"github.com/pingcap/failpoint"
+	"github.com/pingcap/parser/mysql"
 	"github.com/pingcap/tidb/types"
 )
 
@@ -24,10 +25,19 @@ func EncodeDecimal(b []byte, dec *types.MyDecimal, precision, frac int) ([]byte,
 	if precision == 0 {
 		precision, frac = dec.PrecisionAndFrac()
 	}
+	if frac > mysql.MaxDecimalScale {
+		frac = mysql.MaxDecimalScale
+	}
 	b = append(b, byte(precision), byte(frac))
-	bin, err := dec.ToBin(precision, frac)
-	b = append(b, bin...)
+	b, err := dec.WriteBin(precision, frac, b)
 	return b, errors.Trace(err)
+}
+
+func valueSizeOfDecimal(dec *types.MyDecimal, precision, frac int) int {
+	if precision == 0 {
+		precision, frac = dec.PrecisionAndFrac()
+	}
+	return types.DecimalBinSize(precision, frac) + 2
 }
 
 // DecodeDecimal decodes bytes to decimal.

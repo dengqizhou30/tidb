@@ -72,14 +72,13 @@ func (s *testFeedbackSuite) TestUpdateHistogram(c *C) {
 	defaultBucketCount = 7
 	defer func() { defaultBucketCount = originBucketCount }()
 	c.Assert(UpdateHistogram(q.Hist, q).ToString(0), Equals,
-		"column:0 ndv:10058 totColSize:0\n"+
-			"num: 10000 lower_bound: 0 upper_bound: 1 repeats: 0\n"+
-			"num: 9 lower_bound: 2 upper_bound: 7 repeats: 0\n"+
-			"num: 11 lower_bound: 8 upper_bound: 19 repeats: 0\n"+
-			"num: 0 lower_bound: 20 upper_bound: 20 repeats: 0\n"+
-			"num: 18 lower_bound: 21 upper_bound: 39 repeats: 0\n"+
-			"num: 18 lower_bound: 40 upper_bound: 58 repeats: 0\n"+
-			"num: 2 lower_bound: 59 upper_bound: 60 repeats: 0")
+		"column:0 ndv:10053 totColSize:0\n"+
+			"num: 10001 lower_bound: 0 upper_bound: 2 repeats: 0\n"+
+			"num: 7 lower_bound: 2 upper_bound: 5 repeats: 0\n"+
+			"num: 4 lower_bound: 5 upper_bound: 7 repeats: 0\n"+
+			"num: 11 lower_bound: 10 upper_bound: 20 repeats: 0\n"+
+			"num: 19 lower_bound: 30 upper_bound: 49 repeats: 0\n"+
+			"num: 11 lower_bound: 50 upper_bound: 60 repeats: 0")
 }
 
 func (s *testFeedbackSuite) TestSplitBuckets(c *C) {
@@ -238,7 +237,7 @@ func (s *testFeedbackSuite) TestFeedbackEncoding(c *C) {
 	val, err := EncodeFeedback(q)
 	c.Assert(err, IsNil)
 	rq := &QueryFeedback{}
-	c.Assert(DecodeFeedback(val, rq, nil, hist.Tp), IsNil)
+	c.Assert(DecodeFeedback(val, rq, nil, nil, hist.Tp), IsNil)
 	for _, fb := range rq.Feedback {
 		fb.Lower.SetBytes(codec.EncodeInt(nil, fb.Lower.GetInt64()))
 		fb.Upper.SetBytes(codec.EncodeInt(nil, fb.Upper.GetInt64()))
@@ -253,7 +252,7 @@ func (s *testFeedbackSuite) TestFeedbackEncoding(c *C) {
 	c.Assert(err, IsNil)
 	rq = &QueryFeedback{}
 	cms := NewCMSketch(4, 4)
-	c.Assert(DecodeFeedback(val, rq, cms, hist.Tp), IsNil)
+	c.Assert(DecodeFeedback(val, rq, cms, nil, hist.Tp), IsNil)
 	c.Assert(cms.QueryBytes(codec.EncodeInt(nil, 0)), Equals, uint64(1))
 	q.Feedback = q.Feedback[:1]
 	c.Assert(q.Equal(rq), IsTrue)

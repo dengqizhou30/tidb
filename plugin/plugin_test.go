@@ -19,8 +19,13 @@ import (
 	"strconv"
 	"testing"
 
+	"github.com/pingcap/check"
 	"github.com/pingcap/tidb/sessionctx/variable"
 )
+
+func TestT(t *testing.T) {
+	check.TestingT(t)
+}
 
 func TestLoadPluginSuccess(t *testing.T) {
 	ctx := context.Background()
@@ -32,7 +37,6 @@ func TestLoadPluginSuccess(t *testing.T) {
 	cfg := Config{
 		Plugins:        []string{pluginSign},
 		PluginDir:      "",
-		GlobalSysVar:   &variable.SysVars,
 		PluginVarNames: &variable.PluginVarNames,
 		EnvVersion:     map[string]uint16{"go": 1112},
 	}

@@ -15,6 +15,7 @@ package server
 
 import (
 	"archive/zip"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -34,7 +35,6 @@ import (
 	"github.com/pingcap/tidb/statistics/handle"
 	"github.com/pingcap/tidb/store/tikv"
 	"github.com/pingcap/tidb/util/sqlexec"
-	"github.com/pingcap/tidb/util/testkit"
 )
 
 type sqlInfoFetcher struct {
@@ -88,7 +88,7 @@ func (sh *sqlInfoFetcher) zipInfoForSQL(w http.ResponseWriter, r *http.Request) 
 	timeoutString := r.FormValue("timeout")
 	curDB := strings.ToLower(r.FormValue("current_db"))
 	if curDB != "" {
-		_, err = sh.s.Execute(reqCtx, "use %v"+curDB)
+		_, err = sh.s.Execute(reqCtx, fmt.Sprintf("use %v", curDB))
 		if err != nil {
 			serveError(w, http.StatusInternalServerError, fmt.Sprintf("use database %v failed, err: %v", curDB, err))
 			return
@@ -171,7 +171,7 @@ func (sh *sqlInfoFetcher) zipInfoForSQL(w http.ResponseWriter, r *http.Request) 
 			terror.Log(err)
 			return
 		}
-		sRows, err := testkit.ResultSetToStringSlice(reqCtx, sh.s, recordSets[0])
+		sRows, err := session.ResultSetToStringSlice(reqCtx, sh.s, recordSets[0])
 		if err != nil {
 			err = sh.writeErrFile(zw, "explain.err.txt", err)
 			terror.Log(err)
@@ -192,7 +192,8 @@ func (sh *sqlInfoFetcher) zipInfoForSQL(w http.ResponseWriter, r *http.Request) 
 		resultChan := make(chan *explainAnalyzeResult)
 		go sh.getExplainAnalyze(ctx, sql, resultChan)
 		errChan := make(chan error)
-		go sh.catchCPUProfile(reqCtx, pprofTime, zw, errChan)
+		var buf bytes.Buffer
+		go sh.catchCPUProfile(reqCtx, pprofTime, &buf, errChan)
 		select {
 		case result := <-resultChan:
 			timer.Stop()
@@ -216,13 +217,29 @@ func (sh *sqlInfoFetcher) zipInfoForSQL(w http.ResponseWriter, r *http.Request) 
 		case <-timer.C:
 			cancelFunc()
 		}
-		err = <-errChan
+		err = dumpCPUProfile(errChan, &buf, zw)
 		if err != nil {
 			err = sh.writeErrFile(zw, "profile.err.txt", err)
 			terror.Log(err)
 			return
 		}
 	}
+}
+
+func dumpCPUProfile(errChan chan error, buf *bytes.Buffer, zw *zip.Writer) error {
+	err := <-errChan
+	if err != nil {
+		return err
+	}
+	fw, err := zw.Create("profile")
+	if err != nil {
+		return err
+	}
+	_, err = fw.Write(buf.Bytes())
+	if err != nil {
+		return err
+	}
+	return nil
 }
 
 func (sh *sqlInfoFetcher) writeErrFile(zw *zip.Writer, name string, err error) error {
@@ -241,30 +258,23 @@ type explainAnalyzeResult struct {
 
 func (sh *sqlInfoFetcher) getExplainAnalyze(ctx context.Context, sql string, resultChan chan<- *explainAnalyzeResult) {
 	recordSets, err := sh.s.(sqlexec.SQLExecutor).Execute(ctx, fmt.Sprintf("explain analyze %s", sql))
-	if len(recordSets) > 0 {
-		defer terror.Call(recordSets[0].Close)
-	}
 	if err != nil {
 		resultChan <- &explainAnalyzeResult{err: err}
 		return
 	}
-	rows, err := testkit.ResultSetToStringSlice(ctx, sh.s, recordSets[0])
+	rows, err := session.ResultSetToStringSlice(ctx, sh.s, recordSets[0])
 	if err != nil {
 		terror.Log(err)
-		rows = nil
 		return
+	}
+	if len(recordSets) > 0 {
+		terror.Call(recordSets[0].Close)
 	}
 	resultChan <- &explainAnalyzeResult{rows: rows}
 }
 
-func (sh *sqlInfoFetcher) catchCPUProfile(ctx context.Context, sec int, zw *zip.Writer, errChan chan<- error) {
-	// dump profile
-	fw, err := zw.Create("profile")
-	if err != nil {
-		errChan <- err
-		return
-	}
-	if err := pprof.StartCPUProfile(fw); err != nil {
+func (sh *sqlInfoFetcher) catchCPUProfile(ctx context.Context, sec int, buf *bytes.Buffer, errChan chan<- error) {
+	if err := pprof.StartCPUProfile(buf); err != nil {
 		errChan <- err
 		return
 	}
@@ -292,7 +302,7 @@ func (sh *sqlInfoFetcher) getShowCreateTable(pair tableNamePair, zw *zip.Writer)
 	if err != nil {
 		return err
 	}
-	sRows, err := testkit.ResultSetToStringSlice(context.Background(), sh.s, recordSets[0])
+	sRows, err := session.ResultSetToStringSlice(context.Background(), sh.s, recordSets[0])
 	if err != nil {
 		terror.Log(err)
 		return nil

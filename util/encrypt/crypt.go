@@ -88,11 +88,6 @@ func (sc *sqlCrypt) init(password []byte, length int) {
 	sc.shift = 0
 }
 
-func (sc *sqlCrypt) reinit() {
-	sc.shift = 0
-	sc.rand = sc.orgRand
-}
-
 func (sc *sqlCrypt) encode(str []byte, length int) {
 	for i := 0; i < length; i++ {
 		sc.shift ^= uint32(sc.rand.myRand() * 255.0)
@@ -111,7 +106,7 @@ func (sc *sqlCrypt) decode(str []byte, length int) {
 	}
 }
 
-//SQLDecode Function to handle the decode() function
+// SQLDecode Function to handle the decode() function
 func SQLDecode(str string, password string) (string, error) {
 	var sc sqlCrypt
 

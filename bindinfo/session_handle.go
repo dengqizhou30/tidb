@@ -14,10 +14,13 @@
 package bindinfo
 
 import (
+	"strings"
 	"time"
 
 	"github.com/pingcap/parser"
 	"github.com/pingcap/parser/mysql"
+	"github.com/pingcap/tidb/metrics"
+	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/types"
 )
 
@@ -34,70 +37,79 @@ func NewSessionBindHandle(parser *parser.Parser) *SessionHandle {
 	return sessionHandle
 }
 
-// appendBindMeta addes the BindMeta to the cache, all the stale bindMetas are
+// appendBindRecord adds the BindRecord to the cache, all the stale bindMetas are
 // removed from the cache after this operation.
-func (h *SessionHandle) appendBindMeta(hash string, meta *BindMeta) {
-	// Make sure there is only one goroutine writes the cache.
-	h.ch.removeStaleBindMetas(hash, meta)
-	h.ch[hash] = append(h.ch[hash], meta)
+func (h *SessionHandle) appendBindRecord(hash string, meta *BindRecord) {
+	oldRecord := h.ch.getBindRecord(hash, meta.OriginalSQL, meta.Db)
+	h.ch.setBindRecord(hash, meta)
+	updateMetrics(metrics.ScopeSession, oldRecord, meta, false)
 }
 
-func (h *SessionHandle) newBindMeta(record *BindRecord) (hash string, meta *BindMeta, err error) {
-	hash = parser.DigestHash(record.OriginalSQL)
-	stmtNodes, _, err := h.parser.Parse(record.BindSQL, record.Charset, record.Collation)
+// CreateBindRecord creates a BindRecord to the cache.
+// It replaces all the exists bindings for the same normalized SQL.
+func (h *SessionHandle) CreateBindRecord(sctx sessionctx.Context, record *BindRecord) (err error) {
+	err = record.prepareHints(sctx)
 	if err != nil {
-		return "", nil, err
+		return err
 	}
-	meta = &BindMeta{BindRecord: record, Ast: stmtNodes[0]}
-	return hash, meta, nil
-}
-
-// AddBindRecord new a BindRecord with BindMeta, add it to the cache.
-func (h *SessionHandle) AddBindRecord(record *BindRecord) error {
-	record.CreateTime = types.Time{
-		Time: types.FromGoTime(time.Now()),
-		Type: mysql.TypeDatetime,
-		Fsp:  3,
+	record.Db = strings.ToLower(record.Db)
+	now := types.NewTime(types.FromGoTime(time.Now().In(sctx.GetSessionVars().StmtCtx.TimeZone)), mysql.TypeTimestamp, 3)
+	for i := range record.Bindings {
+		record.Bindings[i].CreateTime = now
+		record.Bindings[i].UpdateTime = now
 	}
-	record.UpdateTime = record.CreateTime
 
 	// update the BindMeta to the cache.
-	hash, meta, err := h.newBindMeta(record)
-	if err == nil {
-		h.appendBindMeta(hash, meta)
-	}
-	return err
+	h.appendBindRecord(parser.DigestNormalized(record.OriginalSQL), record)
+	return nil
 }
 
 // DropBindRecord drops a BindRecord in the cache.
-func (h *SessionHandle) DropBindRecord(record *BindRecord) {
-	meta := &BindMeta{BindRecord: record}
-	meta.Status = deleted
-	hash := parser.DigestHash(record.OriginalSQL)
-	h.ch.removeDeletedBindMeta(hash, meta)
-	h.appendBindMeta(hash, meta)
+func (h *SessionHandle) DropBindRecord(originalSQL, db string, binding *Binding) error {
+	db = strings.ToLower(db)
+	oldRecord := h.GetBindRecord(originalSQL, db)
+	var newRecord *BindRecord
+	record := &BindRecord{OriginalSQL: originalSQL, Db: db}
+	if binding != nil {
+		record.Bindings = append(record.Bindings, *binding)
+	}
+	if oldRecord != nil {
+		newRecord = oldRecord.remove(record)
+	} else {
+		newRecord = record
+	}
+	h.ch.setBindRecord(parser.DigestNormalized(record.OriginalSQL), newRecord)
+	updateMetrics(metrics.ScopeSession, oldRecord, newRecord, false)
+	return nil
 }
 
 // GetBindRecord return the BindMeta of the (normdOrigSQL,db) if BindMeta exist.
-func (h *SessionHandle) GetBindRecord(normdOrigSQL, db string) *BindMeta {
-	hash := parser.DigestHash(normdOrigSQL)
+func (h *SessionHandle) GetBindRecord(normdOrigSQL, db string) *BindRecord {
+	hash := parser.DigestNormalized(normdOrigSQL)
 	bindRecords := h.ch[hash]
-	if bindRecords != nil {
-		for _, bindRecord := range bindRecords {
-			if bindRecord.OriginalSQL == normdOrigSQL && bindRecord.Db == db {
-				return bindRecord
-			}
+	for _, bindRecord := range bindRecords {
+		if bindRecord.OriginalSQL == normdOrigSQL {
+			return bindRecord
 		}
 	}
 	return nil
 }
 
 // GetAllBindRecord return all session bind info.
-func (h *SessionHandle) GetAllBindRecord() (bindRecords []*BindMeta) {
+func (h *SessionHandle) GetAllBindRecord() (bindRecords []*BindRecord) {
 	for _, bindRecord := range h.ch {
 		bindRecords = append(bindRecords, bindRecord...)
 	}
 	return bindRecords
+}
+
+// Close closes the session handle.
+func (h *SessionHandle) Close() {
+	for _, bindRecords := range h.ch {
+		for _, bindRecord := range bindRecords {
+			updateMetrics(metrics.ScopeSession, bindRecord, nil, false)
+		}
+	}
 }
 
 // sessionBindInfoKeyType is a dummy type to avoid naming collision in context.

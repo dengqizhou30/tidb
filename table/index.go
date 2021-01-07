@@ -14,6 +14,8 @@
 package table
 
 import (
+	"context"
+
 	"github.com/pingcap/parser/model"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/sessionctx"
@@ -23,15 +25,15 @@ import (
 
 // IndexIterator is the interface for iterator of index data on KV store.
 type IndexIterator interface {
-	Next() (k []types.Datum, h int64, err error)
+	Next() (k []types.Datum, h kv.Handle, err error)
 	Close()
 }
 
 // CreateIdxOpt contains the options will be used when creating an index.
 type CreateIdxOpt struct {
-	SkipHandleCheck   bool // If true, skip the handle constraint check.
-	SkipCheck         bool // If true, skip all the unique indices constraint check.
-	kv.AssertionProto      // If not nil, check assertion.
+	Ctx             context.Context
+	SkipHandleCheck bool // If true, skip the handle constraint check.
+	Untouched       bool // If true, the index key/value is no need to commit.
 }
 
 // CreateIdxOptFunc is defined for the Create() method of Index interface.
@@ -44,15 +46,16 @@ var SkipHandleCheck CreateIdxOptFunc = func(opt *CreateIdxOpt) {
 	opt.SkipHandleCheck = true
 }
 
-// SkipCheck is a defined value of CreateIdxFunc.
-var SkipCheck CreateIdxOptFunc = func(opt *CreateIdxOpt) {
-	opt.SkipCheck = true
+// IndexIsUntouched uses to indicate the index kv is untouched.
+var IndexIsUntouched CreateIdxOptFunc = func(opt *CreateIdxOpt) {
+	opt.Untouched = true
 }
 
-// WithAssertion returns a CreateIdxFunc.
-func WithAssertion(x kv.AssertionProto) CreateIdxOptFunc {
+// WithCtx returns a CreateIdxFunc.
+// This option is used to pass context.Context.
+func WithCtx(ctx context.Context) CreateIdxOptFunc {
 	return func(opt *CreateIdxOpt) {
-		opt.AssertionProto = x
+		opt.Ctx = ctx
 	}
 }
 
@@ -61,15 +64,17 @@ type Index interface {
 	// Meta returns IndexInfo.
 	Meta() *model.IndexInfo
 	// Create supports insert into statement.
-	Create(ctx sessionctx.Context, rm kv.RetrieverMutator, indexedValues []types.Datum, h int64, opts ...CreateIdxOptFunc) (int64, error)
+	Create(ctx sessionctx.Context, us kv.UnionStore, indexedValues []types.Datum, h kv.Handle, opts ...CreateIdxOptFunc) (kv.Handle, error)
 	// Delete supports delete from statement.
-	Delete(sc *stmtctx.StatementContext, m kv.Mutator, indexedValues []types.Datum, h int64, ss kv.Transaction) error
+	Delete(sc *stmtctx.StatementContext, us kv.UnionStore, indexedValues []types.Datum, h kv.Handle) error
 	// Drop supports drop table, drop index statements.
-	Drop(rm kv.RetrieverMutator) error
+	Drop(us kv.UnionStore) error
 	// Exist supports check index exists or not.
-	Exist(sc *stmtctx.StatementContext, rm kv.RetrieverMutator, indexedValues []types.Datum, h int64) (bool, int64, error)
+	Exist(sc *stmtctx.StatementContext, us kv.UnionStore, indexedValues []types.Datum, h kv.Handle) (bool, kv.Handle, error)
 	// GenIndexKey generates an index key.
-	GenIndexKey(sc *stmtctx.StatementContext, indexedValues []types.Datum, h int64, buf []byte) (key []byte, distinct bool, err error)
+	GenIndexKey(sc *stmtctx.StatementContext, indexedValues []types.Datum, h kv.Handle, buf []byte) (key []byte, distinct bool, err error)
+	// GenIndexValue generates an index value.
+	GenIndexValue(sc *stmtctx.StatementContext, indexedValues []types.Datum, distinct bool, untouched bool, h kv.Handle) (val []byte, err error)
 	// Seek supports where clause.
 	Seek(sc *stmtctx.StatementContext, r kv.Retriever, indexedValues []types.Datum) (iter IndexIterator, hit bool, err error)
 	// SeekFirst supports aggregate min and ascend order by.

@@ -14,63 +14,38 @@
 package executor
 
 import (
-	"github.com/pingcap/parser/mysql"
-	"github.com/pingcap/parser/terror"
-)
-
-// Error codes that are not mapping to mysql error codes.
-const (
-	codeUnknownPlan = iota
-	codePrepareMulti
-	codePrepareDDL
-	codeResultIsEmpty
-	codeErrBuildExec
-	codeBatchInsertFail
-	codeGetStartTS
+	mysql "github.com/pingcap/tidb/errno"
+	"github.com/pingcap/tidb/util/dbterror"
 )
 
 // Error instances.
 var (
-	ErrGetStartTS      = terror.ClassExecutor.New(codeGetStartTS, "Can not get start ts")
-	ErrUnknownPlan     = terror.ClassExecutor.New(codeUnknownPlan, "Unknown plan")
-	ErrPrepareMulti    = terror.ClassExecutor.New(codePrepareMulti, "Can not prepare multiple statements")
-	ErrPrepareDDL      = terror.ClassExecutor.New(codePrepareDDL, "Can not prepare DDL statements with parameters")
-	ErrResultIsEmpty   = terror.ClassExecutor.New(codeResultIsEmpty, "result is empty")
-	ErrBuildExecutor   = terror.ClassExecutor.New(codeErrBuildExec, "Failed to build executor")
-	ErrBatchInsertFail = terror.ClassExecutor.New(codeBatchInsertFail, "Batch insert failed, please clean the table and try again.")
+	ErrGetStartTS      = dbterror.ClassExecutor.NewStd(mysql.ErrGetStartTS)
+	ErrUnknownPlan     = dbterror.ClassExecutor.NewStd(mysql.ErrUnknownPlan)
+	ErrPrepareMulti    = dbterror.ClassExecutor.NewStd(mysql.ErrPrepareMulti)
+	ErrPrepareDDL      = dbterror.ClassExecutor.NewStd(mysql.ErrPrepareDDL)
+	ErrResultIsEmpty   = dbterror.ClassExecutor.NewStd(mysql.ErrResultIsEmpty)
+	ErrBuildExecutor   = dbterror.ClassExecutor.NewStd(mysql.ErrBuildExecutor)
+	ErrBatchInsertFail = dbterror.ClassExecutor.NewStd(mysql.ErrBatchInsertFail)
+	ErrUnsupportedPs   = dbterror.ClassExecutor.NewStd(mysql.ErrUnsupportedPs)
 
-	ErrCantCreateUserWithGrant     = terror.ClassExecutor.New(mysql.ErrCantCreateUserWithGrant, mysql.MySQLErrName[mysql.ErrCantCreateUserWithGrant])
-	ErrPasswordNoMatch             = terror.ClassExecutor.New(mysql.ErrPasswordNoMatch, mysql.MySQLErrName[mysql.ErrPasswordNoMatch])
-	ErrCannotUser                  = terror.ClassExecutor.New(mysql.ErrCannotUser, mysql.MySQLErrName[mysql.ErrCannotUser])
-	ErrPasswordFormat              = terror.ClassExecutor.New(mysql.ErrPasswordFormat, mysql.MySQLErrName[mysql.ErrPasswordFormat])
-	ErrCantChangeTxCharacteristics = terror.ClassExecutor.New(mysql.ErrCantChangeTxCharacteristics, mysql.MySQLErrName[mysql.ErrCantChangeTxCharacteristics])
-	ErrPsManyParam                 = terror.ClassExecutor.New(mysql.ErrPsManyParam, mysql.MySQLErrName[mysql.ErrPsManyParam])
-	ErrAdminCheckTable             = terror.ClassExecutor.New(mysql.ErrAdminCheckTable, mysql.MySQLErrName[mysql.ErrAdminCheckTable])
-	ErrDBaccessDenied              = terror.ClassExecutor.New(mysql.ErrDBaccessDenied, mysql.MySQLErrName[mysql.ErrDBaccessDenied])
-	ErrTableaccessDenied           = terror.ClassExecutor.New(mysql.ErrTableaccessDenied, mysql.MySQLErrName[mysql.ErrTableaccessDenied])
-	ErrBadDB                       = terror.ClassExecutor.New(mysql.ErrBadDB, mysql.MySQLErrName[mysql.ErrBadDB])
-	ErrWrongObject                 = terror.ClassExecutor.New(mysql.ErrWrongObject, mysql.MySQLErrName[mysql.ErrWrongObject])
-	ErrRoleNotGranted              = terror.ClassPrivilege.New(mysql.ErrRoleNotGranted, mysql.MySQLErrName[mysql.ErrRoleNotGranted])
-	ErrDeadlock                    = terror.ClassExecutor.New(mysql.ErrLockDeadlock, mysql.MySQLErrName[mysql.ErrLockDeadlock])
-	ErrQueryInterrupted            = terror.ClassExecutor.New(mysql.ErrQueryInterrupted, mysql.MySQLErrName[mysql.ErrQueryInterrupted])
+	ErrCantCreateUserWithGrant     = dbterror.ClassExecutor.NewStd(mysql.ErrCantCreateUserWithGrant)
+	ErrPasswordNoMatch             = dbterror.ClassExecutor.NewStd(mysql.ErrPasswordNoMatch)
+	ErrCannotUser                  = dbterror.ClassExecutor.NewStd(mysql.ErrCannotUser)
+	ErrPasswordFormat              = dbterror.ClassExecutor.NewStd(mysql.ErrPasswordFormat)
+	ErrCantChangeTxCharacteristics = dbterror.ClassExecutor.NewStd(mysql.ErrCantChangeTxCharacteristics)
+	ErrPsManyParam                 = dbterror.ClassExecutor.NewStd(mysql.ErrPsManyParam)
+	ErrAdminCheckTable             = dbterror.ClassExecutor.NewStd(mysql.ErrAdminCheckTable)
+	ErrDBaccessDenied              = dbterror.ClassExecutor.NewStd(mysql.ErrDBaccessDenied)
+	ErrTableaccessDenied           = dbterror.ClassExecutor.NewStd(mysql.ErrTableaccessDenied)
+	ErrBadDB                       = dbterror.ClassExecutor.NewStd(mysql.ErrBadDB)
+	ErrWrongObject                 = dbterror.ClassExecutor.NewStd(mysql.ErrWrongObject)
+	ErrRoleNotGranted              = dbterror.ClassPrivilege.NewStd(mysql.ErrRoleNotGranted)
+	ErrDeadlock                    = dbterror.ClassExecutor.NewStd(mysql.ErrLockDeadlock)
+	ErrQueryInterrupted            = dbterror.ClassExecutor.NewStd(mysql.ErrQueryInterrupted)
+
+	ErrBRIEBackupFailed  = dbterror.ClassExecutor.NewStd(mysql.ErrBRIEBackupFailed)
+	ErrBRIERestoreFailed = dbterror.ClassExecutor.NewStd(mysql.ErrBRIERestoreFailed)
+	ErrBRIEImportFailed  = dbterror.ClassExecutor.NewStd(mysql.ErrBRIEImportFailed)
+	ErrBRIEExportFailed  = dbterror.ClassExecutor.NewStd(mysql.ErrBRIEExportFailed)
 )
-
-func init() {
-	// Map error codes to mysql error codes.
-	tableMySQLErrCodes := map[terror.ErrCode]uint16{
-		mysql.ErrPasswordNoMatch:             mysql.ErrPasswordNoMatch,
-		mysql.ErrCannotUser:                  mysql.ErrCannotUser,
-		mysql.ErrWrongValueCountOnRow:        mysql.ErrWrongValueCountOnRow,
-		mysql.ErrPasswordFormat:              mysql.ErrPasswordFormat,
-		mysql.ErrCantChangeTxCharacteristics: mysql.ErrCantChangeTxCharacteristics,
-		mysql.ErrPsManyParam:                 mysql.ErrPsManyParam,
-		mysql.ErrAdminCheckTable:             mysql.ErrAdminCheckTable,
-		mysql.ErrDBaccessDenied:              mysql.ErrDBaccessDenied,
-		mysql.ErrTableaccessDenied:           mysql.ErrTableaccessDenied,
-		mysql.ErrBadDB:                       mysql.ErrBadDB,
-		mysql.ErrWrongObject:                 mysql.ErrWrongObject,
-		mysql.ErrLockDeadlock:                mysql.ErrLockDeadlock,
-		mysql.ErrQueryInterrupted:            mysql.ErrQueryInterrupted,
-	}
-	terror.ErrClassToMySQLCodes[terror.ClassExecutor] = tableMySQLErrCodes
-}

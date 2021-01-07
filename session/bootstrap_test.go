@@ -20,6 +20,7 @@ import (
 	. "github.com/pingcap/check"
 	"github.com/pingcap/parser"
 	"github.com/pingcap/parser/auth"
+	"github.com/pingcap/tidb/config"
 	"github.com/pingcap/tidb/domain"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/meta"
@@ -28,8 +29,6 @@ import (
 	"github.com/pingcap/tidb/statistics"
 	"github.com/pingcap/tidb/util/testleak"
 )
-
-var _ = Suite(&testBootstrapSuite{})
 
 type testBootstrapSuite struct {
 	dbName          string
@@ -56,11 +55,12 @@ func (s *testBootstrapSuite) TestBootstrap(c *C) {
 	c.Assert(err, IsNil)
 	c.Assert(req.NumRows() == 0, IsFalse)
 	datums := statistics.RowToDatums(req.GetRow(0), r.Fields())
-	match(c, datums, []byte(`%`), []byte("root"), []byte(""), "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "N")
+	match(c, datums, `%`, "root", []byte(""), "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "N", "Y", "Y", "Y", "Y", "Y", "Y", "Y")
 
 	c.Assert(se.Auth(&auth.UserIdentity{Username: "root", Hostname: "anyhost"}, []byte(""), []byte("")), IsTrue)
 	mustExecSQL(c, se, "USE test;")
 	// Check privilege tables.
+	mustExecSQL(c, se, "SELECT * from mysql.global_priv;")
 	mustExecSQL(c, se, "SELECT * from mysql.db;")
 	mustExecSQL(c, se, "SELECT * from mysql.tables_priv;")
 	mustExecSQL(c, se, "SELECT * from mysql.columns_priv;")
@@ -76,7 +76,7 @@ func (s *testBootstrapSuite) TestBootstrap(c *C) {
 	mustExecSQL(c, se, "USE test;")
 	mustExecSQL(c, se, "drop table if exists t")
 	mustExecSQL(c, se, "create table t (id int)")
-	delete(storeBootstrapped, store.UUID())
+	unsetStoreBootstrapped(store.UUID())
 	se.Close()
 	se, err = CreateSession4Test(store)
 	c.Assert(err, IsNil)
@@ -105,7 +105,7 @@ func (s *testBootstrapSuite) TestBootstrap(c *C) {
 
 func globalVarsCount() int64 {
 	var count int64
-	for _, v := range variable.SysVars {
+	for _, v := range variable.GetSysVars() {
 		if v.Scope != variable.ScopeSession {
 			count++
 		}
@@ -160,11 +160,12 @@ func (s *testBootstrapSuite) TestBootstrapWithError(c *C) {
 	c.Assert(req.NumRows() == 0, IsFalse)
 	row := req.GetRow(0)
 	datums := statistics.RowToDatums(row, r.Fields())
-	match(c, datums, []byte(`%`), []byte("root"), []byte(""), "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "N")
+	match(c, datums, `%`, "root", []byte(""), "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "N", "Y", "Y", "Y", "Y", "Y", "Y", "Y")
 	c.Assert(r.Close(), IsNil)
 
 	mustExecSQL(c, se, "USE test;")
 	// Check privilege tables.
+	mustExecSQL(c, se, "SELECT * from mysql.global_priv;")
 	mustExecSQL(c, se, "SELECT * from mysql.db;")
 	mustExecSQL(c, se, "SELECT * from mysql.tables_priv;")
 	mustExecSQL(c, se, "SELECT * from mysql.columns_priv;")
@@ -229,7 +230,7 @@ func (s *testBootstrapSuite) TestUpgrade(c *C) {
 	mustExecSQL(c, se1, fmt.Sprintf(`delete from mysql.global_variables where VARIABLE_NAME="%s";`,
 		variable.TiDBDistSQLScanConcurrency))
 	mustExecSQL(c, se1, `commit;`)
-	delete(storeBootstrapped, store.UUID())
+	unsetStoreBootstrapped(store.UUID())
 	// Make sure the version is downgraded.
 	r = mustExecSQL(c, se1, `SELECT VARIABLE_VALUE from mysql.TiDB where VARIABLE_NAME="tidb_server_version";`)
 	req = r.NewChunk()
@@ -260,6 +261,183 @@ func (s *testBootstrapSuite) TestUpgrade(c *C) {
 	ver, err = getBootstrapVersion(se2)
 	c.Assert(err, IsNil)
 	c.Assert(ver, Equals, int64(currentBootstrapVersion))
+
+	// Verify that 'new_collation_enabled' is false.
+	r = mustExecSQL(c, se2, fmt.Sprintf(`SELECT VARIABLE_VALUE from mysql.TiDB where VARIABLE_NAME='%s';`, tidbNewCollationEnabled))
+	req = r.NewChunk()
+	err = r.Next(ctx, req)
+	c.Assert(err, IsNil)
+	c.Assert(req.NumRows(), Equals, 1)
+	c.Assert(req.GetRow(0).GetString(0), Equals, "False")
+	c.Assert(r.Close(), IsNil)
+}
+
+func (s *testBootstrapSuite) TestIssue17979_1(c *C) {
+	oomAction := config.GetGlobalConfig().OOMAction
+	defer func() {
+		config.UpdateGlobal(func(conf *config.Config) {
+			conf.OOMAction = oomAction
+		})
+	}()
+	ctx := context.Background()
+	defer testleak.AfterTest(c)()
+	store, _ := newStoreWithBootstrap(c, s.dbName)
+	defer store.Close()
+
+	// test issue 20900, upgrade from v3.0 to v4.0.11+
+	seV3 := newSession(c, store, s.dbName)
+	txn, err := store.Begin()
+	c.Assert(err, IsNil)
+	m := meta.NewMeta(txn)
+	err = m.FinishBootstrap(int64(58))
+	c.Assert(err, IsNil)
+	err = txn.Commit(context.Background())
+	c.Assert(err, IsNil)
+	mustExecSQL(c, seV3, "update mysql.tidb set variable_value='58' where variable_name='tidb_server_version'")
+	mustExecSQL(c, seV3, "delete from mysql.tidb where variable_name='default_oom_action'")
+	mustExecSQL(c, seV3, "commit")
+	unsetStoreBootstrapped(store.UUID())
+	ver, err := getBootstrapVersion(seV3)
+	c.Assert(err, IsNil)
+	c.Assert(ver, Equals, int64(58))
+
+	domV4, err := BootstrapSession(store)
+	c.Assert(err, IsNil)
+	defer domV4.Close()
+	seV4 := newSession(c, store, s.dbName)
+	ver, err = getBootstrapVersion(seV4)
+	c.Assert(err, IsNil)
+	c.Assert(ver, Equals, int64(currentBootstrapVersion))
+	r := mustExecSQL(c, seV4, "select variable_value from mysql.tidb where variable_name='default_oom_action'")
+	req := r.NewChunk()
+	r.Next(ctx, req)
+	c.Assert(req.GetRow(0).GetString(0), Equals, "log")
+	c.Assert(config.GetGlobalConfig().OOMAction, Equals, config.OOMActionLog)
+}
+
+func (s *testBootstrapSuite) TestIssue17979_2(c *C) {
+	oomAction := config.GetGlobalConfig().OOMAction
+	defer func() {
+		config.UpdateGlobal(func(conf *config.Config) {
+			conf.OOMAction = oomAction
+		})
+	}()
+	ctx := context.Background()
+	defer testleak.AfterTest(c)()
+	store, _ := newStoreWithBootstrap(c, s.dbName)
+	defer store.Close()
+
+	// test issue 20900, upgrade from v4.0.11 to v4.0.11
+	seV3 := newSession(c, store, s.dbName)
+	txn, err := store.Begin()
+	c.Assert(err, IsNil)
+	m := meta.NewMeta(txn)
+	err = m.FinishBootstrap(int64(59))
+	c.Assert(err, IsNil)
+	err = txn.Commit(context.Background())
+	c.Assert(err, IsNil)
+	mustExecSQL(c, seV3, "update mysql.tidb set variable_value=59 where variable_name='tidb_server_version'")
+	mustExecSQL(c, seV3, "delete from mysql.tidb where variable_name='default_iim_action'")
+	mustExecSQL(c, seV3, "commit")
+	unsetStoreBootstrapped(store.UUID())
+	ver, err := getBootstrapVersion(seV3)
+	c.Assert(err, IsNil)
+	c.Assert(ver, Equals, int64(59))
+
+	domV4, err := BootstrapSession(store)
+	c.Assert(err, IsNil)
+	defer domV4.Close()
+	seV4 := newSession(c, store, s.dbName)
+	ver, err = getBootstrapVersion(seV4)
+	c.Assert(err, IsNil)
+	c.Assert(ver, Equals, int64(currentBootstrapVersion))
+	r := mustExecSQL(c, seV4, "select variable_value from mysql.tidb where variable_name='default_oom_action'")
+	req := r.NewChunk()
+	r.Next(ctx, req)
+	c.Assert(req.NumRows(), Equals, 0)
+	c.Assert(config.GetGlobalConfig().OOMAction, Equals, config.OOMActionCancel)
+}
+
+func (s *testBootstrapSuite) TestIssue20900_1(c *C) {
+	ctx := context.Background()
+	defer testleak.AfterTest(c)()
+	store, _ := newStoreWithBootstrap(c, s.dbName)
+	defer store.Close()
+
+	// test issue 20900, upgrade from v3.0 to v4.0.9+
+	seV3 := newSession(c, store, s.dbName)
+	txn, err := store.Begin()
+	c.Assert(err, IsNil)
+	m := meta.NewMeta(txn)
+	err = m.FinishBootstrap(int64(38))
+	c.Assert(err, IsNil)
+	err = txn.Commit(context.Background())
+	c.Assert(err, IsNil)
+	mustExecSQL(c, seV3, "update mysql.tidb set variable_value=38 where variable_name='tidb_server_version'")
+	mustExecSQL(c, seV3, "delete from mysql.tidb where variable_name='default_memory_quota_query'")
+	mustExecSQL(c, seV3, "commit")
+	unsetStoreBootstrapped(store.UUID())
+	ver, err := getBootstrapVersion(seV3)
+	c.Assert(err, IsNil)
+	c.Assert(ver, Equals, int64(38))
+
+	domV4, err := BootstrapSession(store)
+	c.Assert(err, IsNil)
+	defer domV4.Close()
+	seV4 := newSession(c, store, s.dbName)
+	ver, err = getBootstrapVersion(seV4)
+	c.Assert(err, IsNil)
+	c.Assert(ver, Equals, int64(currentBootstrapVersion))
+	r := mustExecSQL(c, seV4, "select @@tidb_mem_quota_query")
+	req := r.NewChunk()
+	r.Next(ctx, req)
+	c.Assert(req.GetRow(0).GetString(0), Equals, "34359738368")
+	r = mustExecSQL(c, seV4, "select variable_value from mysql.tidb where variable_name='default_memory_quota_query'")
+	req = r.NewChunk()
+	r.Next(ctx, req)
+	c.Assert(req.GetRow(0).GetString(0), Equals, "34359738368")
+	c.Assert(seV4.GetSessionVars().MemQuotaQuery, Equals, int64(34359738368))
+}
+
+func (s *testBootstrapSuite) TestIssue20900_2(c *C) {
+	ctx := context.Background()
+	defer testleak.AfterTest(c)()
+	store, _ := newStoreWithBootstrap(c, s.dbName)
+	defer store.Close()
+
+	// test issue 20900, upgrade from v4.0.8 to v4.0.9+
+	seV3 := newSession(c, store, s.dbName)
+	txn, err := store.Begin()
+	c.Assert(err, IsNil)
+	m := meta.NewMeta(txn)
+	err = m.FinishBootstrap(int64(52))
+	c.Assert(err, IsNil)
+	err = txn.Commit(context.Background())
+	c.Assert(err, IsNil)
+	mustExecSQL(c, seV3, "update mysql.tidb set variable_value=52 where variable_name='tidb_server_version'")
+	mustExecSQL(c, seV3, "delete from mysql.tidb where variable_name='default_memory_quota_query'")
+	mustExecSQL(c, seV3, "commit")
+	unsetStoreBootstrapped(store.UUID())
+	ver, err := getBootstrapVersion(seV3)
+	c.Assert(err, IsNil)
+	c.Assert(ver, Equals, int64(52))
+
+	domV4, err := BootstrapSession(store)
+	c.Assert(err, IsNil)
+	defer domV4.Close()
+	seV4 := newSession(c, store, s.dbName)
+	ver, err = getBootstrapVersion(seV4)
+	c.Assert(err, IsNil)
+	c.Assert(ver, Equals, int64(currentBootstrapVersion))
+	r := mustExecSQL(c, seV4, "select @@tidb_mem_quota_query")
+	req := r.NewChunk()
+	r.Next(ctx, req)
+	c.Assert(req.GetRow(0).GetString(0), Equals, "1073741824")
+	c.Assert(seV4.GetSessionVars().MemQuotaQuery, Equals, int64(1073741824))
+	r = mustExecSQL(c, seV4, "select variable_value from mysql.tidb where variable_name='default_memory_quota_query'")
+	req = r.NewChunk()
+	r.Next(ctx, req)
+	c.Assert(req.NumRows(), Equals, 0)
 }
 
 func (s *testBootstrapSuite) TestANSISQLMode(c *C) {
@@ -270,7 +448,7 @@ func (s *testBootstrapSuite) TestANSISQLMode(c *C) {
 	mustExecSQL(c, se, "USE mysql;")
 	mustExecSQL(c, se, `set @@global.sql_mode="NO_AUTO_CREATE_USER,NO_ENGINE_SUBSTITUTION,ANSI"`)
 	mustExecSQL(c, se, `delete from mysql.TiDB where VARIABLE_NAME="tidb_server_version";`)
-	delete(storeBootstrapped, store.UUID())
+	unsetStoreBootstrapped(store.UUID())
 	se.Close()
 
 	// Do some clean up, BootstrapSession will not create a new domain otherwise.
@@ -308,4 +486,52 @@ func (s *testBootstrapSuite) TestBootstrapInitExpensiveQueryHandle(c *C) {
 	defer dom.Close()
 	dom.InitExpensiveQueryHandle()
 	c.Assert(dom.ExpensiveQueryHandle(), NotNil)
+}
+
+func (s *testBootstrapSuite) TestStmtSummary(c *C) {
+	defer testleak.AfterTest(c)()
+	ctx := context.Background()
+	store, dom := newStoreWithBootstrap(c, s.dbName)
+	defer store.Close()
+	defer dom.Close()
+	se := newSession(c, store, s.dbName)
+	mustExecSQL(c, se, `update mysql.global_variables set variable_value='' where variable_name='tidb_enable_stmt_summary'`)
+	writeStmtSummaryVars(se)
+
+	r := mustExecSQL(c, se, "select variable_value from mysql.global_variables where variable_name='tidb_enable_stmt_summary'")
+	req := r.NewChunk()
+	c.Assert(r.Next(ctx, req), IsNil)
+	row := req.GetRow(0)
+	c.Assert(row.GetBytes(0), BytesEquals, []byte("ON"))
+	c.Assert(r.Close(), IsNil)
+}
+
+func (s *testBootstrapSuite) TestUpdateBindInfo(c *C) {
+	defer testleak.AfterTest(c)()
+	ctx := context.Background()
+	store, dom := newStoreWithBootstrap(c, s.dbName)
+	defer store.Close()
+	defer dom.Close()
+	se := newSession(c, store, s.dbName)
+	mustExecSQL(c, se, `insert into mysql.bind_info values('select * from t where a > ?','select /*+ use_index(t, idxb) */ * from t where a > 1', 'test','using', '2021-01-04 14:50:58.257','2021-01-04 14:50:58.257', 'utf8', 'utf8_general_ci', 'manual')`)
+
+	upgradeToVer61(se, version60)
+	r := mustExecSQL(c, se, `select original_sql, bind_sql, default_db, status from mysql.bind_info where source != 'builtin'`)
+	req := r.NewChunk()
+	c.Assert(r.Next(ctx, req), IsNil)
+	row := req.GetRow(0)
+	c.Assert(row.GetString(0), Equals, "select * from test . t where a > ?")
+	c.Assert(row.GetString(1), Equals, "SELECT /*+ use_index(t idxb)*/ * FROM test.t WHERE a > 1")
+	c.Assert(row.GetString(2), Equals, "")
+	c.Assert(row.GetString(3), Equals, "using")
+	c.Assert(r.Close(), IsNil)
+	mustExecSQL(c, se, `drop global binding for select * from test.t where a > 1`)
+	r = mustExecSQL(c, se, `select original_sql, bind_sql, status from mysql.bind_info where source != 'builtin'`)
+	c.Assert(r.Next(ctx, req), IsNil)
+	row = req.GetRow(0)
+	c.Assert(row.GetString(0), Equals, "select * from test . t where a > ?")
+	c.Assert(row.GetString(1), Equals, "SELECT /*+ use_index(t idxb)*/ * FROM test.t WHERE a > 1")
+	c.Assert(row.GetString(2), Equals, "deleted")
+	c.Assert(r.Close(), IsNil)
+	mustExecSQL(c, se, `delete from mysql.bind_info where original_sql = 'select * from test . t where a > ?'`)
 }

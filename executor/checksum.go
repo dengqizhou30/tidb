@@ -187,45 +187,69 @@ func newChecksumContext(db *model.DBInfo, table *model.TableInfo, startTs uint64
 }
 
 func (c *checksumContext) BuildRequests(ctx sessionctx.Context) ([]*kv.Request, error) {
-	reqs := make([]*kv.Request, 0, len(c.TableInfo.Indices)+1)
-	req, err := c.buildTableRequest(ctx)
-	if err != nil {
+	var partDefs []model.PartitionDefinition
+	if part := c.TableInfo.Partition; part != nil {
+		partDefs = part.Definitions
+	}
+
+	reqs := make([]*kv.Request, 0, (len(c.TableInfo.Indices)+1)*(len(partDefs)+1))
+	if err := c.appendRequest(ctx, c.TableInfo.ID, &reqs); err != nil {
 		return nil, err
 	}
-	reqs = append(reqs, req)
-	for _, indexInfo := range c.TableInfo.Indices {
-		if indexInfo.State != model.StatePublic {
-			continue
-		}
-		req, err = c.buildIndexRequest(ctx, indexInfo)
-		if err != nil {
+
+	for _, partDef := range partDefs {
+		if err := c.appendRequest(ctx, partDef.ID, &reqs); err != nil {
 			return nil, err
 		}
-		reqs = append(reqs, req)
 	}
 
 	return reqs, nil
 }
 
-func (c *checksumContext) buildTableRequest(ctx sessionctx.Context) (*kv.Request, error) {
+func (c *checksumContext) appendRequest(ctx sessionctx.Context, tableID int64, reqs *[]*kv.Request) error {
+	req, err := c.buildTableRequest(ctx, tableID)
+	if err != nil {
+		return err
+	}
+
+	*reqs = append(*reqs, req)
+	for _, indexInfo := range c.TableInfo.Indices {
+		if indexInfo.State != model.StatePublic {
+			continue
+		}
+		req, err = c.buildIndexRequest(ctx, tableID, indexInfo)
+		if err != nil {
+			return err
+		}
+		*reqs = append(*reqs, req)
+	}
+
+	return nil
+}
+
+func (c *checksumContext) buildTableRequest(ctx sessionctx.Context, tableID int64) (*kv.Request, error) {
 	checksum := &tipb.ChecksumRequest{
-		StartTs:   c.StartTs,
 		ScanOn:    tipb.ChecksumScanOn_Table,
 		Algorithm: tipb.ChecksumAlgorithm_Crc64_Xor,
 	}
 
-	ranges := ranger.FullIntRange(false)
+	var ranges []*ranger.Range
+	if c.TableInfo.IsCommonHandle {
+		ranges = ranger.FullNotNullRange()
+	} else {
+		ranges = ranger.FullIntRange(false)
+	}
 
 	var builder distsql.RequestBuilder
-	return builder.SetTableRanges(c.TableInfo.ID, ranges, nil).
+	return builder.SetHandleRanges(ctx.GetSessionVars().StmtCtx, tableID, c.TableInfo.IsCommonHandle, ranges, nil).
 		SetChecksumRequest(checksum).
-		SetConcurrency(ctx.GetSessionVars().DistSQLScanConcurrency).
+		SetStartTS(c.StartTs).
+		SetConcurrency(ctx.GetSessionVars().DistSQLScanConcurrency()).
 		Build()
 }
 
-func (c *checksumContext) buildIndexRequest(ctx sessionctx.Context, indexInfo *model.IndexInfo) (*kv.Request, error) {
+func (c *checksumContext) buildIndexRequest(ctx sessionctx.Context, tableID int64, indexInfo *model.IndexInfo) (*kv.Request, error) {
 	checksum := &tipb.ChecksumRequest{
-		StartTs:   c.StartTs,
 		ScanOn:    tipb.ChecksumScanOn_Index,
 		Algorithm: tipb.ChecksumAlgorithm_Crc64_Xor,
 	}
@@ -233,9 +257,10 @@ func (c *checksumContext) buildIndexRequest(ctx sessionctx.Context, indexInfo *m
 	ranges := ranger.FullRange()
 
 	var builder distsql.RequestBuilder
-	return builder.SetIndexRanges(ctx.GetSessionVars().StmtCtx, c.TableInfo.ID, indexInfo.ID, ranges).
+	return builder.SetIndexRanges(ctx.GetSessionVars().StmtCtx, tableID, indexInfo.ID, ranges).
 		SetChecksumRequest(checksum).
-		SetConcurrency(ctx.GetSessionVars().DistSQLScanConcurrency).
+		SetStartTS(c.StartTs).
+		SetConcurrency(ctx.GetSessionVars().DistSQLScanConcurrency()).
 		Build()
 }
 

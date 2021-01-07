@@ -45,6 +45,8 @@ const (
 	ChangeUser
 	// PreAuth presents event before start auth.
 	PreAuth
+	// Reject presents event reject connection event.
+	Reject
 )
 
 func (c ConnectionEvent) String() string {
@@ -57,6 +59,8 @@ func (c ConnectionEvent) String() string {
 		return "ChangeUser"
 	case PreAuth:
 		return "PreAuth"
+	case Reject:
+		return "Reject"
 	}
 	return ""
 }
@@ -84,3 +88,13 @@ type AuditManifest struct {
 	// OnParseEvent will be called around parse logic.
 	OnParseEvent func(ctx context.Context, sctx *variable.SessionVars, event ParseEvent) error
 }
+
+type (
+	// RejectReasonCtxValue will be used in OnConnectionEvent to pass RejectReason to plugin.
+	RejectReasonCtxValue struct{}
+)
+
+type execStartTimeCtxKeyType struct{}
+
+// ExecStartTimeCtxKey indicates stmt start execution time.
+var ExecStartTimeCtxKey = execStartTimeCtxKeyType{}

@@ -25,7 +25,7 @@ var (
 			Subsystem: "statistics",
 			Name:      "auto_analyze_duration_seconds",
 			Help:      "Bucketed histogram of processing time (s) of auto analyze.",
-			Buckets:   prometheus.ExponentialBuckets(0.01, 2, 20), // 10ms ~ 3hours
+			Buckets:   prometheus.ExponentialBuckets(0.01, 2, 24), // 10ms ~ 24h
 		})
 
 	AutoAnalyzeCounter = prometheus.NewCounterVec(
@@ -45,13 +45,13 @@ var (
 			Buckets:   prometheus.ExponentialBuckets(0.01, 2, 14),
 		})
 
-	PseudoEstimation = prometheus.NewCounter(
+	PseudoEstimation = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Namespace: "tidb",
 			Subsystem: "statistics",
 			Name:      "pseudo_estimation_total",
 			Help:      "Counter of pseudo estimation caused by outdated stats.",
-		})
+		}, []string{LblType})
 
 	DumpFeedbackCounter = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
@@ -76,6 +76,14 @@ var (
 			Name:      "store_query_feedback_total",
 			Help:      "Counter of storing query feedback.",
 		}, []string{LblType})
+
+	GetStoreLimitErrorCounter = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "tidb",
+			Subsystem: "statistics",
+			Name:      "get_store_limit_token_error",
+			Help:      "store token is up to the limit, probably because one of the stores is the hotspot or unavailable",
+		}, []string{LblAddress, LblStore})
 
 	SignificantFeedbackCounter = prometheus.NewCounter(
 		prometheus.CounterOpts{

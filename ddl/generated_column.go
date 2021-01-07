@@ -18,6 +18,7 @@ import (
 	"github.com/pingcap/parser/ast"
 	"github.com/pingcap/parser/model"
 	"github.com/pingcap/tidb/expression"
+	"github.com/pingcap/tidb/infoschema"
 	"github.com/pingcap/tidb/table"
 )
 
@@ -49,12 +50,32 @@ func verifyColumnGeneration(colName2Generation map[string]columnGenerationInDDL,
 	return nil
 }
 
-// checkDependedColExist ensure all depended columns exist.
-//
+// verifyColumnGenerationSingle is for ADD GENERATED COLUMN, we just need verify one column itself.
+func verifyColumnGenerationSingle(dependColNames map[string]struct{}, cols []*table.Column, position *ast.ColumnPosition) error {
+	// Since the added column does not exist yet, we should derive it's offset from ColumnPosition.
+	pos, err := findPositionRelativeColumn(cols, position)
+	if err != nil {
+		return errors.Trace(err)
+	}
+	// should check unknown column first, then the prior ones.
+	for _, col := range cols {
+		if _, ok := dependColNames[col.Name.L]; ok {
+			if col.IsGenerated() && col.Offset >= pos {
+				// Generated column can refer only to generated columns defined prior to it.
+				return errGeneratedColumnNonPrior.GenWithStackByArgs()
+			}
+		}
+	}
+	return nil
+}
+
+// checkDependedColExist ensure all depended columns exist and not hidden.
 // NOTE: this will MODIFY parameter `dependCols`.
 func checkDependedColExist(dependCols map[string]struct{}, cols []*table.Column) error {
 	for _, col := range cols {
-		delete(dependCols, col.Name.L)
+		if !col.Hidden {
+			delete(dependCols, col.Name.L)
+		}
 	}
 	if len(dependCols) != 0 {
 		for arbitraryCol := range dependCols {
@@ -62,6 +83,34 @@ func checkDependedColExist(dependCols map[string]struct{}, cols []*table.Column)
 		}
 	}
 	return nil
+}
+
+// findPositionRelativeColumn returns a pos relative to added generated column position.
+func findPositionRelativeColumn(cols []*table.Column, pos *ast.ColumnPosition) (int, error) {
+	position := len(cols)
+	// Get the column position, default is cols's length means appending.
+	// For "alter table ... add column(...)", the position will be nil.
+	// For "alter table ... add column ... ", the position will be default one.
+	if pos == nil {
+		return position, nil
+	}
+	if pos.Tp == ast.ColumnPositionFirst {
+		position = 0
+	} else if pos.Tp == ast.ColumnPositionAfter {
+		var col *table.Column
+		for _, c := range cols {
+			if c.Name.L == pos.RelativeColumn.Name.L {
+				col = c
+				break
+			}
+		}
+		if col == nil {
+			return -1, ErrBadField.GenWithStackByArgs(pos.RelativeColumn, "generated column function")
+		}
+		// Inserted position is after the mentioned column.
+		position = col.Offset + 1
+	}
+	return position, nil
 }
 
 // findDependedColumnNames returns a set of string, which indicates
@@ -111,20 +160,27 @@ func (c *generatedColumnChecker) Leave(inNode ast.Node) (node ast.Node, ok bool)
 //  3. check if the modified expr contains non-deterministic functions
 //  4. check whether new column refers to any auto-increment columns.
 //  5. check if the new column is indexed or stored
-func checkModifyGeneratedColumn(tbl table.Table, oldCol, newCol *table.Column, newColDef *ast.ColumnDef) error {
+func checkModifyGeneratedColumn(tbl table.Table, oldCol, newCol *table.Column, newColDef *ast.ColumnDef, pos *ast.ColumnPosition) error {
 	// rule 1.
 	oldColIsStored := !oldCol.IsGenerated() || oldCol.GeneratedStored
 	newColIsStored := !newCol.IsGenerated() || newCol.GeneratedStored
 	if oldColIsStored != newColIsStored {
-		return errUnsupportedOnGeneratedColumn.GenWithStackByArgs("Changing the STORED status")
+		return ErrUnsupportedOnGeneratedColumn.GenWithStackByArgs("Changing the STORED status")
 	}
 
 	// rule 2.
 	originCols := tbl.Cols()
+	var err error
 	var colName2Generation = make(map[string]columnGenerationInDDL, len(originCols))
 	for i, column := range originCols {
 		// We can compare the pointers simply.
 		if column == oldCol {
+			if pos != nil && pos.Tp != ast.ColumnPositionNone {
+				i, err = findPositionRelativeColumn(originCols, pos)
+				if err != nil {
+					return errors.Trace(err)
+				}
+			}
 			colName2Generation[newCol.Name.L] = columnGenerationInDDL{
 				position:    i,
 				generated:   newCol.IsGenerated(),
@@ -159,12 +215,13 @@ func checkModifyGeneratedColumn(tbl table.Table, oldCol, newCol *table.Column, n
 
 	if newCol.IsGenerated() {
 		// rule 3.
-		if err := checkIllegalFn4GeneratedColumn(newCol.Name.L, newCol.GeneratedExpr); err != nil {
+		if err := checkIllegalFn4Generated(newCol.Name.L, typeColumn, newCol.GeneratedExpr); err != nil {
 			return errors.Trace(err)
 		}
 
 		// rule 4.
-		if err := checkGeneratedWithAutoInc(tbl.Meta(), newColDef); err != nil {
+		_, dependColNames := findDependedColumnNames(newColDef)
+		if err := checkAutoIncrementRef(newColDef.Name.Name.L, dependColNames, tbl.Meta()); err != nil {
 			return errors.Trace(err)
 		}
 
@@ -177,16 +234,41 @@ func checkModifyGeneratedColumn(tbl table.Table, oldCol, newCol *table.Column, n
 }
 
 type illegalFunctionChecker struct {
-	found bool
+	hasIllegalFunc bool
+	hasAggFunc     bool
+	hasRowVal      bool // hasRowVal checks whether the functional index refers to a row value
+	hasWindowFunc  bool
+	otherErr       error
 }
 
 func (c *illegalFunctionChecker) Enter(inNode ast.Node) (outNode ast.Node, skipChildren bool) {
 	switch node := inNode.(type) {
 	case *ast.FuncCallExpr:
-		if _, found := expression.IllegalFunctions4GeneratedColumns[node.FnName.L]; found {
-			c.found = true
+		// Blocked functions & non-builtin functions is not allowed
+		_, IsFunctionBlocked := expression.IllegalFunctions4GeneratedColumns[node.FnName.L]
+		if IsFunctionBlocked || !expression.IsFunctionSupported(node.FnName.L) {
+			c.hasIllegalFunc = true
 			return inNode, true
 		}
+		err := expression.VerifyArgsWrapper(node.FnName.L, len(node.Args))
+		if err != nil {
+			c.otherErr = err
+			return inNode, true
+		}
+	case *ast.SubqueryExpr, *ast.ValuesExpr, *ast.VariableExpr:
+		// Subquery & `values(x)` & variable is not allowed
+		c.hasIllegalFunc = true
+		return inNode, true
+	case *ast.AggregateFuncExpr:
+		// Aggregate function is not allowed
+		c.hasAggFunc = true
+		return inNode, true
+	case *ast.RowExpr:
+		c.hasRowVal = true
+		return inNode, true
+	case *ast.WindowFuncExpr:
+		c.hasWindowFunc = true
+		return inNode, true
 	}
 	return inNode, false
 }
@@ -195,23 +277,41 @@ func (c *illegalFunctionChecker) Leave(inNode ast.Node) (node ast.Node, ok bool)
 	return inNode, true
 }
 
-func checkIllegalFn4GeneratedColumn(colName string, expr ast.ExprNode) error {
+const (
+	typeColumn = iota
+	typeIndex
+)
+
+func checkIllegalFn4Generated(name string, genType int, expr ast.ExprNode) error {
 	if expr == nil {
 		return nil
 	}
 	var c illegalFunctionChecker
 	expr.Accept(&c)
-	if c.found {
-		return ErrGeneratedColumnFunctionIsNotAllowed.GenWithStackByArgs(colName)
+	if c.hasIllegalFunc {
+		switch genType {
+		case typeColumn:
+			return ErrGeneratedColumnFunctionIsNotAllowed.GenWithStackByArgs(name)
+		case typeIndex:
+			return ErrFunctionalIndexFunctionIsNotAllowed.GenWithStackByArgs(name)
+		}
 	}
-	return nil
-}
-
-// Check whether newColumnDef refers to any auto-increment columns.
-func checkGeneratedWithAutoInc(tableInfo *model.TableInfo, newColumnDef *ast.ColumnDef) error {
-	_, dependColNames := findDependedColumnNames(newColumnDef)
-	if err := checkAutoIncrementRef(newColumnDef.Name.Name.L, dependColNames, tableInfo); err != nil {
-		return errors.Trace(err)
+	if c.hasAggFunc {
+		return ErrInvalidGroupFuncUse
+	}
+	if c.hasRowVal {
+		switch genType {
+		case typeColumn:
+			return ErrGeneratedColumnRowValueIsNotAllowed.GenWithStackByArgs(name)
+		case typeIndex:
+			return ErrFunctionalIndexRowValueIsNotAllowed.GenWithStackByArgs(name)
+		}
+	}
+	if c.hasWindowFunc {
+		return errWindowInvalidWindowFuncUse.GenWithStackByArgs(name)
+	}
+	if c.otherErr != nil {
+		return c.otherErr
 	}
 	return nil
 }
@@ -222,13 +322,13 @@ func checkIndexOrStored(tbl table.Table, oldCol, newCol *table.Column) error {
 	}
 
 	if newCol.GeneratedStored {
-		return errUnsupportedOnGeneratedColumn.GenWithStackByArgs("modifying a stored column")
+		return ErrUnsupportedOnGeneratedColumn.GenWithStackByArgs("modifying a stored column")
 	}
 
 	for _, idx := range tbl.Indices() {
 		for _, col := range idx.Meta().Columns {
 			if col.Name.L == newCol.Name.L {
-				return errUnsupportedOnGeneratedColumn.GenWithStackByArgs("modifying an indexed column")
+				return ErrUnsupportedOnGeneratedColumn.GenWithStackByArgs("modifying an indexed column")
 			}
 		}
 	}
@@ -238,10 +338,21 @@ func checkIndexOrStored(tbl table.Table, oldCol, newCol *table.Column) error {
 // checkAutoIncrementRef checks if an generated column depends on an auto-increment column and raises an error if so.
 // See https://dev.mysql.com/doc/refman/5.7/en/create-table-generated-columns.html for details.
 func checkAutoIncrementRef(name string, dependencies map[string]struct{}, tbInfo *model.TableInfo) error {
-	exists, autoIncrementColumn := hasAutoIncrementColumn(tbInfo)
+	exists, autoIncrementColumn := infoschema.HasAutoIncrementColumn(tbInfo)
 	if exists {
 		if _, found := dependencies[autoIncrementColumn]; found {
 			return ErrGeneratedColumnRefAutoInc.GenWithStackByArgs(name)
+		}
+	}
+	return nil
+}
+
+// checkExpressionIndexAutoIncrement checks if an generated column depends on an auto-increment column and raises an error if so.
+func checkExpressionIndexAutoIncrement(name string, dependencies map[string]struct{}, tbInfo *model.TableInfo) error {
+	exists, autoIncrementColumn := infoschema.HasAutoIncrementColumn(tbInfo)
+	if exists {
+		if _, found := dependencies[autoIncrementColumn]; found {
+			return ErrExpressionIndexCanNotRefer.GenWithStackByArgs(name)
 		}
 	}
 	return nil

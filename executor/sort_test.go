@@ -1,4 +1,4 @@
-// Copyright 2019 PingCAP, Inc.
+// Copyright 2020 PingCAP, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,33 +14,107 @@
 package executor_test
 
 import (
+	"fmt"
+	"os"
+	"strings"
+
 	. "github.com/pingcap/check"
+	"github.com/pingcap/failpoint"
+	"github.com/pingcap/tidb/config"
+	"github.com/pingcap/tidb/sessionctx/variable"
+	"github.com/pingcap/tidb/util"
 	"github.com/pingcap/tidb/util/testkit"
 )
 
-func (s *testSuite4) TestSortRand(c *C) {
+func (s *testSerialSuite1) TestSortInDisk(c *C) {
+	s.testSortInDisk(c, false)
+	s.testSortInDisk(c, true)
+}
+
+func (s *testSerialSuite1) testSortInDisk(c *C, removeDir bool) {
+	defer config.RestoreFunc()()
+	config.UpdateGlobal(func(conf *config.Config) {
+		conf.OOMUseTmpStorage = true
+	})
+	c.Assert(failpoint.Enable("github.com/pingcap/tidb/executor/testSortedRowContainerSpill", "return(true)"), IsNil)
+	defer func() {
+		c.Assert(failpoint.Disable("github.com/pingcap/tidb/executor/testSortedRowContainerSpill"), IsNil)
+	}()
+
+	tk := testkit.NewTestKit(c, s.store)
+	tk.MustExec("use test")
+
+	sm := &mockSessionManager1{
+		PS: make([]*util.ProcessInfo, 0),
+	}
+	tk.Se.SetSessionManager(sm)
+	s.domain.ExpensiveQueryHandle().SetSessionManager(sm)
+
+	if removeDir {
+		c.Assert(os.RemoveAll(config.GetGlobalConfig().TempStoragePath), IsNil)
+		defer func() {
+			_, err := os.Stat(config.GetGlobalConfig().TempStoragePath)
+			if err != nil {
+				c.Assert(os.IsExist(err), IsTrue)
+			}
+		}()
+	}
+
+	tk.MustExec("set @@tidb_mem_quota_query=1;")
+	tk.MustExec("set @@tidb_max_chunk_size=32;")
+	tk.MustExec("drop table if exists t")
+	tk.MustExec("create table t(c1 int, c2 int, c3 int)")
+	for i := 0; i < 5; i++ {
+		for j := i; j < 1024; j += 5 {
+			tk.MustExec(fmt.Sprintf("insert into t values(%v, %v, %v)", j, j, j))
+		}
+	}
+	result := tk.MustQuery("select * from t order by c1")
+	for i := 0; i < 1024; i++ {
+		c.Assert(result.Rows()[i][0].(string), Equals, fmt.Sprint(i))
+		c.Assert(result.Rows()[i][1].(string), Equals, fmt.Sprint(i))
+		c.Assert(result.Rows()[i][2].(string), Equals, fmt.Sprint(i))
+	}
+	c.Assert(tk.Se.GetSessionVars().StmtCtx.MemTracker.BytesConsumed(), Equals, int64(0))
+	c.Assert(tk.Se.GetSessionVars().StmtCtx.MemTracker.MaxConsumed(), Greater, int64(0))
+	c.Assert(tk.Se.GetSessionVars().StmtCtx.DiskTracker.BytesConsumed(), Equals, int64(0))
+	c.Assert(tk.Se.GetSessionVars().StmtCtx.DiskTracker.MaxConsumed(), Greater, int64(0))
+}
+
+func (s *testSerialSuite1) TestIssue16696(c *C) {
+	defer config.RestoreFunc()()
+	config.UpdateGlobal(func(conf *config.Config) {
+		conf.OOMUseTmpStorage = true
+	})
+	alarmRatio := variable.MemoryUsageAlarmRatio.Load()
+	variable.MemoryUsageAlarmRatio.Store(0.0)
+	defer variable.MemoryUsageAlarmRatio.Store(alarmRatio)
+
+	c.Assert(failpoint.Enable("github.com/pingcap/tidb/executor/testSortedRowContainerSpill", "return(true)"), IsNil)
+	defer func() {
+		c.Assert(failpoint.Disable("github.com/pingcap/tidb/executor/testSortedRowContainerSpill"), IsNil)
+	}()
+	c.Assert(failpoint.Enable("github.com/pingcap/tidb/executor/testRowContainerSpill", "return(true)"), IsNil)
+	defer func() { c.Assert(failpoint.Disable("github.com/pingcap/tidb/executor/testRowContainerSpill"), IsNil) }()
 	tk := testkit.NewTestKit(c, s.store)
 	tk.MustExec("use test")
 	tk.MustExec("drop table if exists t")
-	tk.MustExec("create table t(a int, b int);")
-
-	tk.MustQuery("explain select a from t order by rand()").Check(testkit.Rows(
-		"Projection_8 10000.00 root test.t.a",
-		"└─Sort_4 10000.00 root col_1:asc",
-		"  └─Projection_9 10000.00 root test.t.a, rand()",
-		"    └─TableReader_7 10000.00 root data:TableScan_6",
-		"      └─TableScan_6 10000.00 cop table:t, range:[-inf,+inf], keep order:false, stats:pseudo",
-	))
-
-	tk.MustQuery("explain select a, b from t order by abs(2)").Check(testkit.Rows(
-		"TableReader_8 10000.00 root data:TableScan_7",
-		"└─TableScan_7 10000.00 cop table:t, range:[-inf,+inf], keep order:false, stats:pseudo"))
-
-	tk.MustQuery("explain select a from t order by abs(rand())+1").Check(testkit.Rows(
-		"Projection_8 10000.00 root test.t.a",
-		"└─Sort_4 10000.00 root col_1:asc",
-		"  └─Projection_9 10000.00 root test.t.a, plus(abs(rand()), 1)",
-		"    └─TableReader_7 10000.00 root data:TableScan_6",
-		"      └─TableScan_6 10000.00 cop table:t, range:[-inf,+inf], keep order:false, stats:pseudo",
-	))
+	tk.MustExec("CREATE TABLE `t` (`a` int(11) DEFAULT NULL,`b` int(11) DEFAULT NULL)")
+	tk.MustExec("insert into t values (1, 1)")
+	for i := 0; i < 6; i++ {
+		tk.MustExec("insert into t select * from t")
+	}
+	tk.MustExec("set tidb_mem_quota_query = 1;")
+	rows := tk.MustQuery("explain analyze  select t1.a, t1.a +1 from t t1 join t t2 join t t3 order by t1.a").Rows()
+	for _, row := range rows {
+		length := len(row)
+		line := fmt.Sprintf("%v", row)
+		disk := fmt.Sprintf("%v", row[length-1])
+		if strings.Contains(line, "Sort") || strings.Contains(line, "HashJoin") {
+			c.Assert(strings.Contains(disk, "0 Bytes"), IsFalse)
+			c.Assert(strings.Contains(disk, "MB") ||
+				strings.Contains(disk, "KB") ||
+				strings.Contains(disk, "Bytes"), IsTrue)
+		}
+	}
 }

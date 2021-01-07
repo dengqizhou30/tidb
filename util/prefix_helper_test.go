@@ -45,7 +45,7 @@ type testPrefixSuite struct {
 
 func (s *testPrefixSuite) SetUpSuite(c *C) {
 	testleak.BeforeTest()
-	store, err := mockstore.NewMockTikvStore()
+	store, err := mockstore.NewMockStore()
 	c.Assert(err, IsNil)
 	s.s = store
 
@@ -140,7 +140,7 @@ func (s *testPrefixSuite) TestPrefix(c *C) {
 	c.Assert(err, IsNil)
 	err = util.DelKeyWithPrefix(txn, []byte("key"))
 	c.Assert(err, IsNil)
-	_, err = txn.Get(k)
+	_, err = txn.Get(context.TODO(), k)
 	c.Assert(terror.ErrorEqual(kv.ErrNotExist, err), IsTrue)
 
 	err = txn.Commit(context.Background())

@@ -19,7 +19,6 @@ import (
 	"math"
 	"net"
 	"strings"
-	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -28,6 +27,7 @@ import (
 	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/types/json"
 	"github.com/pingcap/tidb/util/chunk"
+	"github.com/pingcap/tipb/go-tipb"
 )
 
 var (
@@ -91,7 +91,10 @@ func (c *sleepFunctionClass) getFunction(ctx sessionctx.Context, args []Expressi
 	if err := c.verifyArgs(args); err != nil {
 		return nil, err
 	}
-	bf := newBaseBuiltinFuncWithTp(ctx, args, types.ETInt, types.ETReal)
+	bf, err := newBaseBuiltinFuncWithTp(ctx, c.funcName, args, types.ETInt, types.ETReal)
+	if err != nil {
+		return nil, err
+	}
 	bf.tp.Flen = 21
 	sig := &builtinSleepSig{bf}
 	return sig, nil
@@ -114,18 +117,14 @@ func (b *builtinSleepSig) evalInt(row chunk.Row) (int64, bool, error) {
 	if err != nil {
 		return 0, isNull, err
 	}
+
 	sessVars := b.ctx.GetSessionVars()
-	if isNull {
-		if sessVars.StrictSQLMode {
-			return 0, true, errIncorrectArgs.GenWithStackByArgs("sleep")
-		}
-		return 0, true, nil
-	}
-	// processing argument is negative
-	if val < 0 {
+	if isNull || val < 0 {
 		if sessVars.StrictSQLMode {
 			return 0, false, errIncorrectArgs.GenWithStackByArgs("sleep")
 		}
+		err := errIncorrectArgs.GenWithStackByArgs("sleep")
+		sessVars.StmtCtx.AppendWarning(err)
 		return 0, false, nil
 	}
 
@@ -133,22 +132,8 @@ func (b *builtinSleepSig) evalInt(row chunk.Row) (int64, bool, error) {
 		return 0, false, errIncorrectArgs.GenWithStackByArgs("sleep")
 	}
 
-	dur := time.Duration(val * float64(time.Second.Nanoseconds()))
-	ticker := time.NewTicker(10 * time.Millisecond)
-	defer ticker.Stop()
-	start := time.Now()
-	finish := false
-	for !finish {
-		select {
-		case now := <-ticker.C:
-			if now.Sub(start) > dur {
-				finish = true
-			}
-		default:
-			if atomic.CompareAndSwapUint32(&sessVars.Killed, 1, 0) {
-				return 1, false, nil
-			}
-		}
+	if isKilled := doSleep(val, sessVars); isKilled {
+		return 1, false, nil
 	}
 
 	return 0, false, nil
@@ -162,7 +147,10 @@ func (c *lockFunctionClass) getFunction(ctx sessionctx.Context, args []Expressio
 	if err := c.verifyArgs(args); err != nil {
 		return nil, err
 	}
-	bf := newBaseBuiltinFuncWithTp(ctx, args, types.ETInt, types.ETString, types.ETInt)
+	bf, err := newBaseBuiltinFuncWithTp(ctx, c.funcName, args, types.ETInt, types.ETString, types.ETInt)
+	if err != nil {
+		return nil, err
+	}
 	sig := &builtinLockSig{bf}
 	bf.tp.Flen = 1
 	return sig, nil
@@ -194,7 +182,10 @@ func (c *releaseLockFunctionClass) getFunction(ctx sessionctx.Context, args []Ex
 	if err := c.verifyArgs(args); err != nil {
 		return nil, err
 	}
-	bf := newBaseBuiltinFuncWithTp(ctx, args, types.ETInt, types.ETString)
+	bf, err := newBaseBuiltinFuncWithTp(ctx, c.funcName, args, types.ETInt, types.ETString)
+	if err != nil {
+		return nil, err
+	}
 	sig := &builtinReleaseLockSig{bf}
 	bf.tp.Flen = 1
 	return sig, nil
@@ -227,28 +218,39 @@ func (c *anyValueFunctionClass) getFunction(ctx sessionctx.Context, args []Expre
 		return nil, err
 	}
 	argTp := args[0].GetType().EvalType()
-	bf := newBaseBuiltinFuncWithTp(ctx, args, argTp, argTp)
-	args[0].GetType().Flag |= bf.tp.Flag
-	*bf.tp = *args[0].GetType()
+	bf, err := newBaseBuiltinFuncWithTp(ctx, c.funcName, args, argTp, argTp)
+	if err != nil {
+		return nil, err
+	}
+	ft := args[0].GetType().Clone()
+	ft.Flag |= bf.tp.Flag
+	*bf.tp = *ft
 	var sig builtinFunc
 	switch argTp {
 	case types.ETDecimal:
 		sig = &builtinDecimalAnyValueSig{bf}
+		sig.setPbCode(tipb.ScalarFuncSig_DecimalAnyValue)
 	case types.ETDuration:
 		sig = &builtinDurationAnyValueSig{bf}
+		sig.setPbCode(tipb.ScalarFuncSig_DurationAnyValue)
 	case types.ETInt:
 		bf.tp.Decimal = 0
 		sig = &builtinIntAnyValueSig{bf}
+		sig.setPbCode(tipb.ScalarFuncSig_IntAnyValue)
 	case types.ETJson:
 		sig = &builtinJSONAnyValueSig{bf}
+		sig.setPbCode(tipb.ScalarFuncSig_JSONAnyValue)
 	case types.ETReal:
 		sig = &builtinRealAnyValueSig{bf}
+		sig.setPbCode(tipb.ScalarFuncSig_RealAnyValue)
 	case types.ETString:
 		bf.tp.Decimal = types.UnspecifiedLength
 		sig = &builtinStringAnyValueSig{bf}
+		sig.setPbCode(tipb.ScalarFuncSig_StringAnyValue)
 	case types.ETDatetime, types.ETTimestamp:
 		bf.tp.Charset, bf.tp.Collate, bf.tp.Flag = mysql.DefaultCharset, mysql.DefaultCollationName, 0
 		sig = &builtinTimeAnyValueSig{bf}
+		sig.setPbCode(tipb.ScalarFuncSig_TimeAnyValue)
 	default:
 		return nil, errIncorrectArgs.GenWithStackByArgs("ANY_VALUE")
 	}
@@ -383,7 +385,10 @@ func (c *inetAtonFunctionClass) getFunction(ctx sessionctx.Context, args []Expre
 	if err := c.verifyArgs(args); err != nil {
 		return nil, err
 	}
-	bf := newBaseBuiltinFuncWithTp(ctx, args, types.ETInt, types.ETString)
+	bf, err := newBaseBuiltinFuncWithTp(ctx, c.funcName, args, types.ETInt, types.ETString)
+	if err != nil {
+		return nil, err
+	}
 	bf.tp.Flen = 21
 	bf.tp.Flag |= mysql.UnsignedFlag
 	sig := &builtinInetAtonSig{bf}
@@ -456,7 +461,11 @@ func (c *inetNtoaFunctionClass) getFunction(ctx sessionctx.Context, args []Expre
 	if err := c.verifyArgs(args); err != nil {
 		return nil, err
 	}
-	bf := newBaseBuiltinFuncWithTp(ctx, args, types.ETString, types.ETInt)
+	bf, err := newBaseBuiltinFuncWithTp(ctx, c.funcName, args, types.ETString, types.ETInt)
+	if err != nil {
+		return nil, err
+	}
+	bf.tp.Charset, bf.tp.Collate = ctx.GetSessionVars().GetCharsetInfo()
 	bf.tp.Flen = 93
 	bf.tp.Decimal = 0
 	sig := &builtinInetNtoaSig{bf}
@@ -482,14 +491,14 @@ func (b *builtinInetNtoaSig) evalString(row chunk.Row) (string, bool, error) {
 	}
 
 	if val < 0 || uint64(val) > math.MaxUint32 {
-		//not an IPv4 address.
+		// not an IPv4 address.
 		return "", true, nil
 	}
 	ip := make(net.IP, net.IPv4len)
 	binary.BigEndian.PutUint32(ip, uint32(val))
 	ipv4 := ip.To4()
 	if ipv4 == nil {
-		//Not a vaild ipv4 address.
+		// Not a vaild ipv4 address.
 		return "", true, nil
 	}
 
@@ -504,7 +513,10 @@ func (c *inet6AtonFunctionClass) getFunction(ctx sessionctx.Context, args []Expr
 	if err := c.verifyArgs(args); err != nil {
 		return nil, err
 	}
-	bf := newBaseBuiltinFuncWithTp(ctx, args, types.ETString, types.ETString)
+	bf, err := newBaseBuiltinFuncWithTp(ctx, c.funcName, args, types.ETString, types.ETString)
+	if err != nil {
+		return nil, err
+	}
 	bf.tp.Flen = 16
 	types.SetBinChsClnFlag(bf.tp)
 	bf.tp.Decimal = 0
@@ -541,7 +553,7 @@ func (b *builtinInet6AtonSig) evalString(row chunk.Row) (string, bool, error) {
 
 	var isMappedIpv6 bool
 	if ip.To4() != nil && strings.Contains(val, ":") {
-		//mapped ipv6 address.
+		// mapped ipv6 address.
 		isMappedIpv6 = true
 	}
 
@@ -573,7 +585,11 @@ func (c *inet6NtoaFunctionClass) getFunction(ctx sessionctx.Context, args []Expr
 	if err := c.verifyArgs(args); err != nil {
 		return nil, err
 	}
-	bf := newBaseBuiltinFuncWithTp(ctx, args, types.ETString, types.ETString)
+	bf, err := newBaseBuiltinFuncWithTp(ctx, c.funcName, args, types.ETString, types.ETString)
+	if err != nil {
+		return nil, err
+	}
+	bf.tp.Charset, bf.tp.Collate = ctx.GetSessionVars().GetCharsetInfo()
 	bf.tp.Flen = 117
 	bf.tp.Decimal = 0
 	sig := &builtinInet6NtoaSig{bf}
@@ -597,7 +613,7 @@ func (b *builtinInet6NtoaSig) evalString(row chunk.Row) (string, bool, error) {
 	if err != nil || isNull {
 		return "", true, err
 	}
-	ip := net.IP([]byte(val)).String()
+	ip := net.IP(val).String()
 	if len(val) == net.IPv6len && !strings.Contains(ip, ":") {
 		ip = fmt.Sprintf("::ffff:%s", ip)
 	}
@@ -625,7 +641,10 @@ func (c *isIPv4FunctionClass) getFunction(ctx sessionctx.Context, args []Express
 	if err := c.verifyArgs(args); err != nil {
 		return nil, err
 	}
-	bf := newBaseBuiltinFuncWithTp(ctx, args, types.ETInt, types.ETString)
+	bf, err := newBaseBuiltinFuncWithTp(ctx, c.funcName, args, types.ETInt, types.ETString)
+	if err != nil {
+		return nil, err
+	}
 	bf.tp.Flen = 1
 	sig := &builtinIsIPv4Sig{bf}
 	return sig, nil
@@ -689,7 +708,10 @@ func (c *isIPv4CompatFunctionClass) getFunction(ctx sessionctx.Context, args []E
 	if err := c.verifyArgs(args); err != nil {
 		return nil, err
 	}
-	bf := newBaseBuiltinFuncWithTp(ctx, args, types.ETInt, types.ETString)
+	bf, err := newBaseBuiltinFuncWithTp(ctx, c.funcName, args, types.ETInt, types.ETString)
+	if err != nil {
+		return nil, err
+	}
 	bf.tp.Flen = 1
 	sig := &builtinIsIPv4CompatSig{bf}
 	return sig, nil
@@ -715,7 +737,7 @@ func (b *builtinIsIPv4CompatSig) evalInt(row chunk.Row) (int64, bool, error) {
 
 	ipAddress := []byte(val)
 	if len(ipAddress) != net.IPv6len {
-		//Not an IPv6 address, return false
+		// Not an IPv6 address, return false
 		return 0, false, nil
 	}
 
@@ -734,7 +756,10 @@ func (c *isIPv4MappedFunctionClass) getFunction(ctx sessionctx.Context, args []E
 	if err := c.verifyArgs(args); err != nil {
 		return nil, err
 	}
-	bf := newBaseBuiltinFuncWithTp(ctx, args, types.ETInt, types.ETString)
+	bf, err := newBaseBuiltinFuncWithTp(ctx, c.funcName, args, types.ETInt, types.ETString)
+	if err != nil {
+		return nil, err
+	}
 	bf.tp.Flen = 1
 	sig := &builtinIsIPv4MappedSig{bf}
 	return sig, nil
@@ -760,7 +785,7 @@ func (b *builtinIsIPv4MappedSig) evalInt(row chunk.Row) (int64, bool, error) {
 
 	ipAddress := []byte(val)
 	if len(ipAddress) != net.IPv6len {
-		//Not an IPv6 address, return false
+		// Not an IPv6 address, return false
 		return 0, false, nil
 	}
 
@@ -779,7 +804,10 @@ func (c *isIPv6FunctionClass) getFunction(ctx sessionctx.Context, args []Express
 	if err := c.verifyArgs(args); err != nil {
 		return nil, err
 	}
-	bf := newBaseBuiltinFuncWithTp(ctx, args, types.ETInt, types.ETString)
+	bf, err := newBaseBuiltinFuncWithTp(ctx, c.funcName, args, types.ETInt, types.ETString)
+	if err != nil {
+		return nil, err
+	}
 	bf.tp.Flen = 1
 	sig := &builtinIsIPv6Sig{bf}
 	return sig, nil
@@ -834,7 +862,10 @@ func (c *nameConstFunctionClass) getFunction(ctx sessionctx.Context, args []Expr
 		return nil, err
 	}
 	argTp := args[1].GetType().EvalType()
-	bf := newBaseBuiltinFuncWithTp(ctx, args, argTp, types.ETString, argTp)
+	bf, err := newBaseBuiltinFuncWithTp(ctx, c.funcName, args, argTp, types.ETString, argTp)
+	if err != nil {
+		return nil, err
+	}
 	*bf.tp = *args[1].GetType()
 	var sig builtinFunc
 	switch argTp {
@@ -975,9 +1006,14 @@ func (c *uuidFunctionClass) getFunction(ctx sessionctx.Context, args []Expressio
 	if err := c.verifyArgs(args); err != nil {
 		return nil, err
 	}
-	bf := newBaseBuiltinFuncWithTp(ctx, args, types.ETString)
+	bf, err := newBaseBuiltinFuncWithTp(ctx, c.funcName, args, types.ETString)
+	if err != nil {
+		return nil, err
+	}
+	bf.tp.Charset, bf.tp.Collate = ctx.GetSessionVars().GetCharsetInfo()
 	bf.tp.Flen = 36
 	sig := &builtinUUIDSig{bf}
+	sig.setPbCode(tipb.ScalarFuncSig_UUID)
 	return sig, nil
 }
 

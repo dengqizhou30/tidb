@@ -24,12 +24,11 @@ import (
 	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/types/json"
 	"github.com/pingcap/tidb/util/chunk"
+	"github.com/pingcap/tidb/util/collate"
 	"github.com/pingcap/tidb/util/hack"
-	"github.com/pingcap/tidb/util/testleak"
 )
 
 func (s *testEvaluatorSuite) TestBitCount(c *C) {
-	defer testleak.AfterTest(c)()
 	stmtCtx := s.ctx.GetSessionVars().StmtCtx
 	origin := stmtCtx.IgnoreTruncate
 	stmtCtx.IgnoreTruncate = true
@@ -52,7 +51,7 @@ func (s *testEvaluatorSuite) TestBitCount(c *C) {
 		{float64(-1.1), int64(64)},
 		{float64(-3.1), int64(63)},
 		{uint64(math.MaxUint64), int64(64)},
-		{string("xxx"), int64(0)},
+		{"xxx", int64(0)},
 		{nil, nil},
 	}
 	for _, test := range bitCountCases {
@@ -75,20 +74,19 @@ func (s *testEvaluatorSuite) TestBitCount(c *C) {
 }
 
 func (s *testEvaluatorSuite) TestInFunc(c *C) {
-	defer testleak.AfterTest(c)()
 	fc := funcs[ast.In]
 	decimal1 := types.NewDecFromFloatForTest(123.121)
 	decimal2 := types.NewDecFromFloatForTest(123.122)
 	decimal3 := types.NewDecFromFloatForTest(123.123)
 	decimal4 := types.NewDecFromFloatForTest(123.124)
-	time1 := types.Time{Time: types.FromGoTime(time.Date(2017, 1, 1, 1, 1, 1, 1, time.UTC)), Fsp: 6, Type: mysql.TypeDatetime}
-	time2 := types.Time{Time: types.FromGoTime(time.Date(2017, 1, 2, 1, 1, 1, 1, time.UTC)), Fsp: 6, Type: mysql.TypeDatetime}
-	time3 := types.Time{Time: types.FromGoTime(time.Date(2017, 1, 3, 1, 1, 1, 1, time.UTC)), Fsp: 6, Type: mysql.TypeDatetime}
-	time4 := types.Time{Time: types.FromGoTime(time.Date(2017, 1, 4, 1, 1, 1, 1, time.UTC)), Fsp: 6, Type: mysql.TypeDatetime}
-	duration1 := types.Duration{Duration: time.Duration(12*time.Hour + 1*time.Minute + 1*time.Second)}
-	duration2 := types.Duration{Duration: time.Duration(12*time.Hour + 1*time.Minute)}
-	duration3 := types.Duration{Duration: time.Duration(12*time.Hour + 1*time.Second)}
-	duration4 := types.Duration{Duration: time.Duration(12 * time.Hour)}
+	time1 := types.NewTime(types.FromGoTime(time.Date(2017, 1, 1, 1, 1, 1, 1, time.UTC)), mysql.TypeDatetime, 6)
+	time2 := types.NewTime(types.FromGoTime(time.Date(2017, 1, 2, 1, 1, 1, 1, time.UTC)), mysql.TypeDatetime, 6)
+	time3 := types.NewTime(types.FromGoTime(time.Date(2017, 1, 3, 1, 1, 1, 1, time.UTC)), mysql.TypeDatetime, 6)
+	time4 := types.NewTime(types.FromGoTime(time.Date(2017, 1, 4, 1, 1, 1, 1, time.UTC)), mysql.TypeDatetime, 6)
+	duration1 := types.Duration{Duration: 12*time.Hour + 1*time.Minute + 1*time.Second}
+	duration2 := types.Duration{Duration: 12*time.Hour + 1*time.Minute}
+	duration3 := types.Duration{Duration: 12*time.Hour + 1*time.Second}
+	duration4 := types.Duration{Duration: 12 * time.Hour}
 	json1 := json.CreateBinary("123")
 	json2 := json.CreateBinary("123.1")
 	json3 := json.CreateBinary("123.2")
@@ -127,58 +125,80 @@ func (s *testEvaluatorSuite) TestInFunc(c *C) {
 		c.Assert(err, IsNil)
 		c.Assert(d.GetValue(), Equals, tc.res, Commentf("%v", types.MakeDatums(tc.args)))
 	}
+	collate.SetNewCollationEnabledForTest(true)
+	strD1 := types.NewCollationStringDatum("a", "utf8_general_ci", 0)
+	strD2 := types.NewCollationStringDatum("Á", "utf8_general_ci", 0)
+	fn, err := fc.getFunction(s.ctx, s.datumsToConstants([]types.Datum{strD1, strD2}))
+	c.Assert(err, IsNil)
+	d, isNull, err := fn.evalInt(chunk.Row{})
+	c.Assert(isNull, IsFalse)
+	c.Assert(err, IsNil)
+	c.Assert(d, Equals, int64(1), Commentf("%v, %v", strD1, strD2))
+	chk1 := chunk.NewChunkWithCapacity(nil, 1)
+	chk1.SetNumVirtualRows(1)
+	chk2 := chunk.NewChunkWithCapacity([]*types.FieldType{types.NewFieldType(mysql.TypeTiny)}, 1)
+	err = fn.vecEvalInt(chk1, chk2.Column(0))
+	c.Assert(err, IsNil)
+	c.Assert(chk2.Column(0).GetInt64(0), Equals, int64(1))
+	collate.SetNewCollationEnabledForTest(false)
 }
 
 func (s *testEvaluatorSuite) TestRowFunc(c *C) {
-	defer testleak.AfterTest(c)()
 	fc := funcs[ast.RowFunc]
 	_, err := fc.getFunction(s.ctx, s.datumsToConstants(types.MakeDatums([]interface{}{"1", 1.2, true, 120}...)))
 	c.Assert(err, IsNil)
 }
 
 func (s *testEvaluatorSuite) TestSetVar(c *C) {
-	defer testleak.AfterTest(c)()
 	fc := funcs[ast.SetVar]
+	dec := types.NewDecFromInt(5)
 	testCases := []struct {
 		args []interface{}
 		res  interface{}
 	}{
 		{[]interface{}{"a", "12"}, "12"},
 		{[]interface{}{"b", "34"}, "34"},
-		{[]interface{}{"c", nil}, ""},
+		{[]interface{}{"c", nil}, nil},
 		{[]interface{}{"c", "ABC"}, "ABC"},
 		{[]interface{}{"c", "dEf"}, "dEf"},
+		{[]interface{}{"d", int64(3)}, int64(3)},
+		{[]interface{}{"e", float64(2.5)}, float64(2.5)},
+		{[]interface{}{"f", dec}, dec},
 	}
 	for _, tc := range testCases {
 		fn, err := fc.getFunction(s.ctx, s.datumsToConstants(types.MakeDatums(tc.args...)))
 		c.Assert(err, IsNil)
 		d, err := evalBuiltinFunc(fn, chunk.MutRowFromDatums(types.MakeDatums(tc.args...)).ToRow())
 		c.Assert(err, IsNil)
-		c.Assert(d.GetString(), Equals, tc.res)
+		c.Assert(d.GetValue(), Equals, tc.res)
 		if tc.args[1] != nil {
 			key, ok := tc.args[0].(string)
 			c.Assert(ok, Equals, true)
-			val, ok := tc.res.(string)
+			sessionVar, ok := s.ctx.GetSessionVars().Users[key]
 			c.Assert(ok, Equals, true)
-			c.Assert(s.ctx.GetSessionVars().Users[key], Equals, val)
+			c.Assert(sessionVar.GetValue(), Equals, tc.res)
 		}
 	}
 }
 
 func (s *testEvaluatorSuite) TestGetVar(c *C) {
-	defer testleak.AfterTest(c)()
-	fc := funcs[ast.GetVar]
-
+	dec := types.NewDecFromInt(5)
 	sessionVars := []struct {
 		key string
-		val string
+		val interface{}
 	}{
 		{"a", "中"},
 		{"b", "文字符chuan"},
 		{"c", ""},
+		{"e", int64(3)},
+		{"f", float64(2.5)},
+		{"g", dec},
 	}
 	for _, kv := range sessionVars {
-		s.ctx.GetSessionVars().Users[kv.key] = kv.val
+		s.ctx.GetSessionVars().Users[kv.key] = types.NewDatum(kv.val)
+		tp := types.NewFieldType(mysql.TypeVarString)
+		types.DefaultParamTypeForValue(kv.val, tp)
+		s.ctx.GetSessionVars().UserVarTypes[kv.key] = tp
 	}
 
 	testCases := []struct {
@@ -188,26 +208,25 @@ func (s *testEvaluatorSuite) TestGetVar(c *C) {
 		{[]interface{}{"a"}, "中"},
 		{[]interface{}{"b"}, "文字符chuan"},
 		{[]interface{}{"c"}, ""},
-		{[]interface{}{"d"}, ""},
+		{[]interface{}{"d"}, nil},
+		{[]interface{}{"e"}, int64(3)},
+		{[]interface{}{"f"}, float64(2.5)},
+		{[]interface{}{"g"}, dec},
 	}
 	for _, tc := range testCases {
-		fn, err := fc.getFunction(s.ctx, s.datumsToConstants(types.MakeDatums(tc.args...)))
+		tp, ok := s.ctx.GetSessionVars().UserVarTypes[tc.args[0].(string)]
+		if !ok {
+			tp = types.NewFieldType(mysql.TypeVarString)
+		}
+		fn, err := BuildGetVarFunction(s.ctx, s.datumsToConstants(types.MakeDatums(tc.args...))[0], tp)
 		c.Assert(err, IsNil)
-		d, err := evalBuiltinFunc(fn, chunk.MutRowFromDatums(types.MakeDatums(tc.args...)).ToRow())
+		d, err := fn.Eval(chunk.Row{})
 		c.Assert(err, IsNil)
-		c.Assert(d.GetString(), Equals, tc.res)
+		c.Assert(d.GetValue(), Equals, tc.res)
 	}
 }
 
 func (s *testEvaluatorSuite) TestValues(c *C) {
-	defer testleak.AfterTest(c)()
-
-	origin := s.ctx.GetSessionVars().StmtCtx.InInsertStmt
-	s.ctx.GetSessionVars().StmtCtx.InInsertStmt = false
-	defer func() {
-		s.ctx.GetSessionVars().StmtCtx.InInsertStmt = origin
-	}()
-
 	fc := &valuesFunctionClass{baseFunctionClass{ast.Values, 0, 0}, 1, types.NewFieldType(mysql.TypeVarchar)}
 	_, err := fc.getFunction(s.ctx, s.datumsToConstants(types.MakeDatums("")))
 	c.Assert(err, ErrorMatches, "*Incorrect parameter count in the call to native function 'values'")
@@ -221,11 +240,10 @@ func (s *testEvaluatorSuite) TestValues(c *C) {
 
 	s.ctx.GetSessionVars().CurrInsertValues = chunk.MutRowFromDatums(types.MakeDatums("1")).ToRow()
 	ret, err = evalBuiltinFunc(sig, chunk.Row{})
-	c.Assert(err, IsNil)
-	c.Assert(ret.IsNull(), IsTrue)
+	c.Assert(err, NotNil)
+	c.Assert(err.Error(), Matches, "Session current insert values len.*")
 
 	currInsertValues := types.MakeDatums("1", "2")
-	s.ctx.GetSessionVars().StmtCtx.InInsertStmt = true
 	s.ctx.GetSessionVars().CurrInsertValues = chunk.MutRowFromDatums(currInsertValues).ToRow()
 	ret, err = evalBuiltinFunc(sig, chunk.Row{})
 	c.Assert(err, IsNil)
@@ -236,8 +254,6 @@ func (s *testEvaluatorSuite) TestValues(c *C) {
 }
 
 func (s *testEvaluatorSuite) TestSetVarFromColumn(c *C) {
-	defer testleak.AfterTest(c)()
-
 	// Construct arguments.
 	argVarName := &Constant{
 		Value:   types.NewStringDatum("a"),
@@ -275,5 +291,7 @@ func (s *testEvaluatorSuite) TestSetVarFromColumn(c *C) {
 	sessionVars := s.ctx.GetSessionVars()
 	sessionVars.UsersLock.RLock()
 	defer sessionVars.UsersLock.RUnlock()
-	c.Assert(sessionVars.Users["a"], Equals, "a")
+	sessionVar, ok := sessionVars.Users["a"]
+	c.Assert(ok, Equals, true)
+	c.Assert(sessionVar.GetString(), Equals, "a")
 }

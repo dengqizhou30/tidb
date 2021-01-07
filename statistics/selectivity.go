@@ -15,14 +15,19 @@ package statistics
 
 import (
 	"math"
+	"math/bits"
+	"sort"
 
 	"github.com/pingcap/errors"
 	"github.com/pingcap/parser/ast"
 	"github.com/pingcap/parser/mysql"
 	"github.com/pingcap/tidb/expression"
+	planutil "github.com/pingcap/tidb/planner/util"
 	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/types"
+	"github.com/pingcap/tidb/util/logutil"
 	"github.com/pingcap/tidb/util/ranger"
+	"go.uber.org/zap"
 )
 
 // If one condition can't be calculated, we will assume that the selectivity of this condition is 0.8.
@@ -51,6 +56,27 @@ const (
 	PkType
 	ColType
 )
+
+func compareType(l, r int) int {
+	if l == r {
+		return 0
+	}
+	if l == ColType {
+		return -1
+	}
+	if l == PkType {
+		return 1
+	}
+	if r == ColType {
+		return 1
+	}
+	return -1
+}
+
+// MockStatsNode is only used for test.
+func MockStatsNode(id int64, m int64, num int) *StatsNode {
+	return &StatsNode{ID: id, mask: m, numCols: num}
+}
 
 const unknownColumnID = math.MinInt64
 
@@ -147,7 +173,7 @@ func isColEqCorCol(filter expression.Expression) *expression.Column {
 // The definition of selectivity is (row count after filter / row count before filter).
 // And exprs must be CNF now, in other words, `exprs[0] and exprs[1] and ... and exprs[len - 1]` should be held when you call this.
 // Currently the time complexity is o(n^2).
-func (coll *HistColl) Selectivity(ctx sessionctx.Context, exprs []expression.Expression) (float64, []*StatsNode, error) {
+func (coll *HistColl) Selectivity(ctx sessionctx.Context, exprs []expression.Expression, filledPaths []*planutil.AccessPath) (float64, []*StatsNode, error) {
 	// If table's count is zero or conditions are empty, we should return 100% selectivity.
 	if coll.Count == 0 || len(exprs) == 0 {
 		return 1, nil, nil
@@ -189,7 +215,7 @@ func (coll *HistColl) Selectivity(ctx sessionctx.Context, exprs []expression.Exp
 	for id, colInfo := range coll.Columns {
 		col := expression.ColInfo2Col(extractedCols, colInfo.Info)
 		if col != nil {
-			maskCovered, ranges, _, err := getMaskAndRanges(ctx, remainedExprs, ranger.ColumnRangeType, nil, col)
+			maskCovered, ranges, _, err := getMaskAndRanges(ctx, remainedExprs, ranger.ColumnRangeType, nil, nil, col)
 			if err != nil {
 				return 0, nil, errors.Trace(err)
 			}
@@ -211,6 +237,13 @@ func (coll *HistColl) Selectivity(ctx sessionctx.Context, exprs []expression.Exp
 			nodes[len(nodes)-1].Selectivity = cnt / float64(coll.Count)
 		}
 	}
+	id2Paths := make(map[int64]*planutil.AccessPath)
+	for _, path := range filledPaths {
+		if path.IsTablePath() {
+			continue
+		}
+		id2Paths[path.Index.ID] = path
+	}
 	for id, idxInfo := range coll.Indices {
 		idxCols := expression.FindPrefixOfIndex(extractedCols, coll.Idx2ColumnIDs[id])
 		if len(idxCols) > 0 {
@@ -218,7 +251,7 @@ func (coll *HistColl) Selectivity(ctx sessionctx.Context, exprs []expression.Exp
 			for i := 0; i < len(idxCols); i++ {
 				lengths = append(lengths, idxInfo.Info.Columns[i].Length)
 			}
-			maskCovered, ranges, partCover, err := getMaskAndRanges(ctx, remainedExprs, ranger.IndexRangeType, lengths, idxCols...)
+			maskCovered, ranges, partCover, err := getMaskAndRanges(ctx, remainedExprs, ranger.IndexRangeType, lengths, id2Paths[idxInfo.ID], idxCols...)
 			if err != nil {
 				return 0, nil, errors.Trace(err)
 			}
@@ -238,7 +271,7 @@ func (coll *HistColl) Selectivity(ctx sessionctx.Context, exprs []expression.Exp
 			})
 		}
 	}
-	usedSets := getUsableSetsByGreedy(nodes)
+	usedSets := GetUsableSetsByGreedy(nodes)
 	// Initialize the mask with the full set.
 	mask := (int64(1) << uint(len(remainedExprs))) - 1
 	for _, set := range usedSets {
@@ -252,6 +285,68 @@ func (coll *HistColl) Selectivity(ctx sessionctx.Context, exprs []expression.Exp
 			ret *= selectionFactor
 		}
 	}
+
+	// Now we try to cover those still not covered DNF conditions using independence assumption,
+	// i.e., sel(condA or condB) = sel(condA) + sel(condB) - sel(condA) * sel(condB)
+	if mask > 0 {
+	OUTER:
+		for i, expr := range remainedExprs {
+			if mask&(1<<uint64(i)) == 0 {
+				continue
+			}
+			scalarCond, ok := expr.(*expression.ScalarFunction)
+			// Make sure we only handle DNF condition.
+			if !ok || scalarCond.FuncName.L != ast.LogicOr {
+				continue
+			}
+			// If there're columns not in stats, we won't handle them. This case might happen after DDL operations.
+			cols := expression.ExtractColumns(scalarCond)
+			for i := range cols {
+				if _, ok := coll.Columns[cols[i].UniqueID]; !ok {
+					continue OUTER
+				}
+			}
+
+			dnfItems := expression.FlattenDNFConditions(scalarCond)
+			dnfItems = ranger.MergeDNFItems4Col(ctx, dnfItems)
+			// If the conditions only contain a single column, we won't handle them.
+			if len(dnfItems) <= 1 {
+				continue
+			}
+
+			selectivity := 0.0
+			for _, cond := range dnfItems {
+				// In selectivity calculation, we don't handle CorrelatedColumn, so we directly skip over it.
+				// Other kinds of `Expression`, i.e., Constant, Column and ScalarFunction all can possibly be built into
+				// ranges and used to calculation selectivity, so we accept them all.
+				_, ok := cond.(*expression.CorrelatedColumn)
+				if ok {
+					continue
+				}
+
+				var cnfItems []expression.Expression
+				if scalar, ok := cond.(*expression.ScalarFunction); ok && scalar.FuncName.L == ast.LogicAnd {
+					cnfItems = expression.FlattenCNFConditions(scalar)
+				} else {
+					cnfItems = append(cnfItems, cond)
+				}
+
+				curSelectivity, _, err := coll.Selectivity(ctx, cnfItems, nil)
+				if err != nil {
+					logutil.BgLogger().Debug("something wrong happened, use the default selectivity", zap.Error(err))
+					selectivity = selectionFactor
+				}
+
+				selectivity = selectivity + curSelectivity - selectivity*curSelectivity
+			}
+
+			if selectivity != 0 {
+				ret *= selectivity
+				mask &^= 1 << uint64(i)
+			}
+		}
+	}
+
 	// If there's still conditions which cannot be calculated, we will multiply a selectionFactor.
 	if mask > 0 {
 		ret *= selectionFactor
@@ -259,8 +354,7 @@ func (coll *HistColl) Selectivity(ctx sessionctx.Context, exprs []expression.Exp
 	return ret, nodes, nil
 }
 
-func getMaskAndRanges(ctx sessionctx.Context, exprs []expression.Expression, rangeType ranger.RangeType,
-	lengths []int, cols ...*expression.Column) (mask int64, ranges []*ranger.Range, partCover bool, err error) {
+func getMaskAndRanges(ctx sessionctx.Context, exprs []expression.Expression, rangeType ranger.RangeType, lengths []int, cachedPath *planutil.AccessPath, cols ...*expression.Column) (mask int64, ranges []*ranger.Range, partCover bool, err error) {
 	sc := ctx.GetSessionVars().StmtCtx
 	isDNF := false
 	var accessConds, remainedConds []expression.Expression
@@ -269,9 +363,16 @@ func getMaskAndRanges(ctx sessionctx.Context, exprs []expression.Expression, ran
 		accessConds = ranger.ExtractAccessConditionsForColumn(exprs, cols[0].UniqueID)
 		ranges, err = ranger.BuildColumnRange(accessConds, sc, cols[0].RetType, types.UnspecifiedLength)
 	case ranger.IndexRangeType:
+		if cachedPath != nil {
+			ranges, accessConds, remainedConds, isDNF = cachedPath.Ranges, cachedPath.AccessConds, cachedPath.TableFilters, cachedPath.IsDNFCond
+			break
+		}
 		var res *ranger.DetachRangeResult
 		res, err = ranger.DetachCondAndBuildRangeForIndex(ctx, exprs, cols, lengths)
 		ranges, accessConds, remainedConds, isDNF = res.Ranges, res.AccessConds, res.RemainedConds, res.IsDNFCond
+		if err != nil {
+			return 0, nil, false, err
+		}
 	default:
 		panic("should never be here")
 	}
@@ -293,29 +394,48 @@ func getMaskAndRanges(ctx sessionctx.Context, exprs []expression.Expression, ran
 	return mask, ranges, false, nil
 }
 
-// getUsableSetsByGreedy will select the indices and pk used for calculate selectivity by greedy algorithm.
-func getUsableSetsByGreedy(nodes []*StatsNode) (newBlocks []*StatsNode) {
+// GetUsableSetsByGreedy will select the indices and pk used for calculate selectivity by greedy algorithm.
+func GetUsableSetsByGreedy(nodes []*StatsNode) (newBlocks []*StatsNode) {
+	sort.Slice(nodes, func(i int, j int) bool {
+		if r := compareType(nodes[i].Tp, nodes[j].Tp); r != 0 {
+			return r < 0
+		}
+		return nodes[i].ID < nodes[j].ID
+	})
 	marked := make([]bool, len(nodes))
 	mask := int64(math.MaxInt64)
 	for {
 		// Choose the index that covers most.
-		bestID, bestCount, bestTp, bestNumCols, bestMask := -1, 0, ColType, 0, int64(0)
+		bestID, bestCount, bestTp, bestNumCols, bestMask, bestSel := -1, 0, ColType, 0, int64(0), float64(0)
 		for i, set := range nodes {
 			if marked[i] {
 				continue
 			}
 			curMask := set.mask & mask
-			bits := popCount(curMask)
+			if curMask != set.mask {
+				marked[i] = true
+				continue
+			}
+			bits := bits.OnesCount64(uint64(curMask))
 			// This set cannot cover any thing, just skip it.
 			if bits == 0 {
+				marked[i] = true
 				continue
 			}
 			// We greedy select the stats info based on:
 			// (1): The stats type, always prefer the primary key or index.
 			// (2): The number of expression that it covers, the more the better.
 			// (3): The number of columns that it contains, the less the better.
-			if (bestTp == ColType && set.Tp != ColType) || bestCount < bits || (bestCount == bits && bestNumCols > set.numCols) {
-				bestID, bestCount, bestTp, bestNumCols, bestMask = i, bits, set.Tp, set.numCols, curMask
+			// (4): The selectivity of the covered conditions, the less the better.
+			//      The rationale behind is that lower selectivity tends to reflect more functional dependencies
+			//      between columns. It's hard to decide the priority of this rule against rule 2 and 3, in order
+			//      to avoid massive plan changes between tidb-server versions, I adopt this conservative strategy
+			//      to impose this rule after rule 2 and 3.
+			if (bestTp == ColType && set.Tp != ColType) ||
+				bestCount < bits ||
+				(bestCount == bits && bestNumCols > set.numCols) ||
+				(bestCount == bits && bestNumCols == set.numCols && bestSel > set.Selectivity) {
+				bestID, bestCount, bestTp, bestNumCols, bestMask, bestSel = i, bits, set.Tp, set.numCols, curMask, set.Selectivity
 			}
 		}
 		if bestCount == 0 {
@@ -329,15 +449,4 @@ func getUsableSetsByGreedy(nodes []*StatsNode) (newBlocks []*StatsNode) {
 		marked[bestID] = true
 	}
 	return
-}
-
-// popCount is the digit sum of the binary representation of the number x.
-func popCount(x int64) int {
-	ret := 0
-	// x -= x & -x, remove the lowest bit of the x.
-	// e.g. result will be 2 if x is 3.
-	for ; x > 0; x -= x & -x {
-		ret++
-	}
-	return ret
 }

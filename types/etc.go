@@ -64,11 +64,20 @@ func IsTypeTime(tp byte) bool {
 	return tp == mysql.TypeDatetime || tp == mysql.TypeDate || tp == mysql.TypeTimestamp
 }
 
+// IsTypeInteger returns a boolean indicating whether the tp is integer type.
+func IsTypeInteger(tp byte) bool {
+	switch tp {
+	case mysql.TypeTiny, mysql.TypeShort, mysql.TypeInt24, mysql.TypeLong, mysql.TypeLonglong, mysql.TypeYear:
+		return true
+	}
+	return false
+}
+
 // IsTypeNumeric returns a boolean indicating whether the tp is numeric type.
 func IsTypeNumeric(tp byte) bool {
 	switch tp {
 	case mysql.TypeBit, mysql.TypeTiny, mysql.TypeInt24, mysql.TypeLong, mysql.TypeLonglong, mysql.TypeNewDecimal,
-		mysql.TypeDecimal, mysql.TypeFloat, mysql.TypeDouble, mysql.TypeShort:
+		mysql.TypeFloat, mysql.TypeDouble, mysql.TypeShort:
 		return true
 	}
 	return false
@@ -83,10 +92,7 @@ func IsTemporalWithDate(tp byte) bool {
 // IsBinaryStr returns a boolean indicating
 // whether the field type is a binary string type.
 func IsBinaryStr(ft *FieldType) bool {
-	if ft.Collate == charset.CollationBin && IsString(ft.Tp) {
-		return true
-	}
-	return false
+	return ft.Collate == charset.CollationBin && IsString(ft.Tp)
 }
 
 // IsNonBinaryStr returns a boolean indicating
